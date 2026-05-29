@@ -350,6 +350,7 @@ public function ___execute() {
     $out .= $this->renderExportDropdownScript();
     $out .= $this->renderHelperToolsScript();
     $out .= $this->renderAutoRefreshScript($rangeMeta, (int) $analytics->realtimeWindowMinutes, $pageId, $template);
+    $out .= $this->renderPageSearchScript();
     if($wireTabs) $out .= $this->renderWireTabsScript($activeTab, $engagementView);
     $out .= '</div>';
     return $out;
@@ -415,6 +416,14 @@ public function ___execute() {
         $this->sendDownloadResponse($docx, 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'native-analytics-report-' . date('Ymd-His') . '.docx');
     }
 
+    public function ___executePageSearch() {
+        /** @var NativeAnalytics $analytics */
+        $analytics = $this->modules->get('NativeAnalytics');
+        $term = $this->sanitizer->text($this->input->get('q'));
+        $results = $analytics->searchPagesWithData($term, 10);
+        $this->sendJsonResponse($results);
+    }
+
     protected function sendDownloadResponse($content, $contentType, $filename) {
         if(function_exists('session_write_close')) @session_write_close();
         while(ob_get_level() > 0) {
@@ -427,6 +436,21 @@ public function ___execute() {
         header('Pragma: public');
         header('X-Content-Type-Options: nosniff');
         echo $content;
+        exit;
+    }
+
+    protected function sendJsonResponse($data) {
+        if(function_exists('session_write_close')) @session_write_close();
+        while(ob_get_level() > 0) {
+            @ob_end_clean();
+        }
+        $json = json_encode($data, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+        if($json === false) $json = '[]';
+        header('Content-Type: application/json; charset=utf-8');
+        header('Content-Length: ' . strlen($json));
+        header('Cache-Control: private, no-store');
+        header('X-Content-Type-Options: nosniff');
+        echo $json;
         exit;
     }
 
@@ -840,6 +864,7 @@ protected function renderToolbar(array $rangeMeta, $pageId, $template, array $te
     $out .= '<label>From <input type="date" name="from_date" value="' . $this->sanitizer->entities($rangeMeta['fromDate']) . '"></label>';
     $out .= '<label>To <input type="date" name="to_date" value="' . $this->sanitizer->entities($rangeMeta['toDate']) . '"></label>';
     $out .= '<label>Page ID <input type="number" min="1" name="page_id" value="' . ($pageId > 0 ? (int) $pageId : '') . '"></label>';
+    $out .= '<label class="pwna-pagefind">Find page <input type="text" autocomplete="off" placeholder="Search title or path" data-pwna-pagesearch="1"><div class="pwna-pagefind-results" data-pwna-pagesearch-results hidden></div></label>';
     $out .= '<label>Template <select name="template"><option value="">All templates</option>';
     foreach($templates as $row) {
         $value = $row['label'];
@@ -901,6 +926,7 @@ protected function renderCompareToolbar(array $rangeMeta, array $compareMeta, $p
     }
     $out .= '</select></label>';
     $out .= '<label>Page ID <input type="number" min="1" name="page_id" value="' . ($pageId > 0 ? (int) $pageId : '') . '"></label>';
+    $out .= '<label class="pwna-pagefind">Find page <input type="text" autocomplete="off" placeholder="Search title or path" data-pwna-pagesearch="1"><div class="pwna-pagefind-results" data-pwna-pagesearch-results hidden></div></label>';
     $out .= '<label>Template <select name="template"><option value="">All templates</option>';
     foreach($templates as $row) {
         $value = $row['label'];
@@ -2074,6 +2100,89 @@ protected function renderChartTooltipScript() {
   }
   refresh();
   setInterval(refresh, 10000);
+})();
+</script>
+HTML;
+        return str_replace(['__PWNA_NONCE__', '__PWNA_JSON__'], [$nonceAttr, $json], $script);
+    }
+
+    protected function renderPageSearchScript() {
+        $payload = ['url' => './page-search/'];
+        $json = json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT);
+        if($json === false) $json = '{}';
+        $nonceAttr = $this->getScriptNonceAttribute();
+        $script = <<<'HTML'
+<script__PWNA_NONCE__>
+(function(){
+  if(window.__pwnaPageSearchInit) return;
+  window.__pwnaPageSearchInit = true;
+  var cfg = __PWNA_JSON__;
+  if(!cfg || !cfg.url || !window.fetch) return;
+  function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]||c;});}
+  function init(){
+    document.querySelectorAll('[data-pwna-pagesearch]').forEach(function(input){
+      if(input.dataset.pwnaPagesearchReady==='1') return;
+      input.dataset.pwnaPagesearchReady='1';
+      var label = input.closest('label');
+      var results = label ? label.querySelector('[data-pwna-pagesearch-results]') : null;
+      var form = input.closest('form');
+      var pageIdInput = form ? form.querySelector('input[name=page_id]') : null;
+      if(!results || !pageIdInput) return;
+      var timer = null;
+      var controller = null;
+      function hide(){ results.hidden = true; results.innerHTML = ''; }
+      function render(items){
+        if(!items || !items.length){
+          results.innerHTML = '<div class="pwna-pagefind-empty">No matching pages</div>';
+          results.hidden = false;
+          return;
+        }
+        var html = '';
+        items.forEach(function(it){
+          html += '<button type="button" class="pwna-pagefind-item" data-id="' + esc(it.id) + '">' +
+                  '<span class="pwna-pagefind-title">' + esc(it.title || it.path) + '</span>' +
+                  '<span class="pwna-pagefind-path">' + esc(it.path) + ' (' + esc(it.views) + ')</span>' +
+                  '</button>';
+        });
+        results.innerHTML = html;
+        results.hidden = false;
+      }
+      function search(q){
+        if(controller && controller.abort) controller.abort();
+        controller = (window.AbortController) ? new AbortController() : null;
+        var opts = { credentials: 'same-origin' };
+        if(controller) opts.signal = controller.signal;
+        fetch(cfg.url + '?q=' + encodeURIComponent(q), opts)
+          .then(function(r){ return r.ok ? r.json() : []; })
+          .then(function(data){ render(data); })
+          .catch(function(){ /* aborted or failed: leave field usable */ });
+      }
+      input.addEventListener('input', function(){
+        var q = input.value.trim();
+        if(timer) clearTimeout(timer);
+        if(q.length < 2){ hide(); return; }
+        timer = setTimeout(function(){ search(q); }, 250);
+      });
+      results.addEventListener('click', function(ev){
+        var btn = ev.target.closest('.pwna-pagefind-item');
+        if(!btn) return;
+        pageIdInput.value = btn.getAttribute('data-id');
+        var title = btn.querySelector('.pwna-pagefind-title');
+        input.value = title ? title.textContent : '';
+        hide();
+      });
+      input.addEventListener('keydown', function(ev){ if(ev.key==='Escape') hide(); });
+    });
+    document.addEventListener('click', function(ev){
+      document.querySelectorAll('.pwna-pagefind').forEach(function(lbl){
+        if(!lbl.contains(ev.target)){
+          var r = lbl.querySelector('[data-pwna-pagesearch-results]');
+          if(r){ r.hidden = true; r.innerHTML = ''; }
+        }
+      });
+    });
+  }
+  if(document.readyState==='loading'){ document.addEventListener('DOMContentLoaded', init); } else { init(); }
 })();
 </script>
 HTML;
