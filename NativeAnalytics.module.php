@@ -1933,6 +1933,18 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
         if($pageId > 0) $filters['page_id'] = $pageId;
         if($template !== '') $filters['template'] = $template;
 
+        $renderCharts = trim((string) $input->get('render_charts'));
+        if($renderCharts !== '') {
+            $allowed = ['daily', 'hourly', 'events', 'goals'];
+            $ids = array_values(array_intersect($allowed, array_map('trim', explode(',', $renderCharts))));
+            $this->sendTrackingResponse(200, [
+                'ok' => true,
+                'chartHtml' => $this->getLiveChartHtml($rangeSpec, $filters, $ids),
+                'ts' => date('c'),
+            ]);
+            return;
+        }
+
         $currentVisitors = $this->getCurrentVisitors($minutes, 25, $filters);
         // Attach ip_hash per row so the live panel can render the "Block" action
         // for manage-permission users (mirrors the server-rendered panel).
@@ -3956,6 +3968,33 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
         $goalsRow = $pickLast($this->getGoalDailySeries($oneDay, $filters));
         if($goalsRow) $out['goals'] = $toSlot($goalsRow, (string) ($goalsRow['day'] ?? $slotDay));
 
+        return $out;
+    }
+
+    /**
+     * Renders fresh SVG HTML for the requested live charts. Used only by the
+     * once-a-day rollover re-fetch, not by the every-10s poll.
+     *
+     * @param array $rangeSpec
+     * @param array $filters
+     * @param array $ids  Subset of ['daily','hourly','events','goals'].
+     * @return array<string,string> id => SVG wrap HTML
+     */
+    public function getLiveChartHtml(array $rangeSpec, array $filters, array $ids) {
+        $today = date('Y-m-d');
+        $out = [];
+        foreach($ids as $id) {
+            if($id === 'daily') {
+                $out['daily'] = $this->renderLineChart($this->getDailySeries($rangeSpec, $filters), 'views', 'Traffic trend by day', [], 'daily');
+            } elseif($id === 'hourly') {
+                $hourlyDay = (string) ($rangeSpec['end_date'] ?? $today);
+                $out['hourly'] = $this->renderLineChart($this->getHourlySeries($hourlyDay, $filters), 'views', 'Traffic by hour for selected day', [], 'hourly');
+            } elseif($id === 'events') {
+                $out['events'] = $this->renderLineChart($this->getEventDailySeries($rangeSpec, $filters), 'views', 'Tracked actions by day', [], 'events');
+            } elseif($id === 'goals') {
+                $out['goals'] = $this->renderLineChart($this->getGoalDailySeries($rangeSpec, $filters), 'views', 'Goal conversions by day', ['views' => 'Conversions', 'uniques' => 'Unique visitors', 'sessions' => 'Sessions'], 'goals');
+            }
+        }
         return $out;
     }
 
