@@ -1933,6 +1933,18 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
         if($pageId > 0) $filters['page_id'] = $pageId;
         if($template !== '') $filters['template'] = $template;
 
+        $renderCharts = trim((string) $input->get('render_charts'));
+        if($renderCharts !== '') {
+            $allowed = ['daily', 'hourly', 'events', 'goals'];
+            $ids = array_values(array_intersect($allowed, array_map('trim', explode(',', $renderCharts))));
+            $this->sendTrackingResponse(200, [
+                'ok' => true,
+                'chartHtml' => $this->getLiveChartHtml($rangeSpec, $filters, $ids),
+                'ts' => date('c'),
+            ]);
+            return;
+        }
+
         $currentVisitors = $this->getCurrentVisitors($minutes, 25, $filters);
         // Attach ip_hash per row so the live panel can render the "Block" action
         // for manage-permission users (mirrors the server-rendered panel).
@@ -1955,6 +1967,7 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
             'sessionQuality' => $this->getSessionQuality($rangeSpec, $filters),
             'health' => $this->getHealthSnapshot(),
             'currentVisitors' => $currentVisitors,
+            'chartLatest' => $this->getChartLatestSlots($rangeSpec, $filters),
             'minutes' => $minutes,
             'ts' => date('c'),
         ];
@@ -3902,6 +3915,89 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
         return $series;
     }
 
+    /**
+     * Returns the single moving slot per live trend chart (today's totals, and
+     * the current hour for the hourly chart), keyed for client-side matching.
+     * Reuses the existing series builders with a one-day range so each poll
+     * scans only the current day.
+     *
+     * @param array $rangeSpec Range computed for this request (its end_date is the hourly chart's day).
+     * @param array $filters   page_id / template filters already resolved by the caller.
+     * @return array
+     */
+    public function getChartLatestSlots(array $rangeSpec, array $filters = []) {
+        $today = date('Y-m-d');
+        $slotDay = (string) ($rangeSpec['end_date'] ?? $today);
+        $oneDay = ['start_date' => $slotDay, 'end_date' => $slotDay];
+
+        $pickLast = function(array $series) {
+            $row = end($series);
+            return is_array($row) ? $row : null;
+        };
+        $toSlot = function($row, $key) {
+            if(!is_array($row)) return null;
+            return [
+                'key' => $key,
+                'label' => (string) ($row['label'] ?? ''),
+                'views' => (int) ($row['views'] ?? 0),
+                'uniques' => (int) ($row['uniques'] ?? 0),
+                'sessions' => (int) ($row['sessions'] ?? 0),
+            ];
+        };
+
+        $out = [];
+
+        $dailyRow = $pickLast($this->getDailySeries($oneDay, $filters));
+        if($dailyRow) $out['daily'] = $toSlot($dailyRow, (string) ($dailyRow['day'] ?? $slotDay));
+
+        $hourlyDay = $slotDay;
+        $hourlySeries = $this->getHourlySeries($hourlyDay, $filters);
+        $currentHour = ($hourlyDay === $today) ? (int) date('G') : 23;
+        if(isset($hourlySeries[$currentHour])) {
+            $hourlyRow = $hourlySeries[$currentHour];
+            $slot = $toSlot($hourlyRow, (string) $currentHour);
+            if($slot) {
+                $slot['day'] = $hourlyDay;
+                $out['hourly'] = $slot;
+            }
+        }
+
+        $eventsRow = $pickLast($this->getEventDailySeries($oneDay, $filters));
+        if($eventsRow) $out['events'] = $toSlot($eventsRow, (string) ($eventsRow['day'] ?? $slotDay));
+
+        $goalsRow = $pickLast($this->getGoalDailySeries($oneDay, $filters));
+        if($goalsRow) $out['goals'] = $toSlot($goalsRow, (string) ($goalsRow['day'] ?? $slotDay));
+
+        return $out;
+    }
+
+    /**
+     * Renders fresh SVG HTML for the requested live charts. Used only by the
+     * once-a-day rollover re-fetch, not by the every-10s poll.
+     *
+     * @param array $rangeSpec
+     * @param array $filters
+     * @param array $ids  Subset of ['daily','hourly','events','goals'].
+     * @return array<string,string> id => SVG wrap HTML
+     */
+    public function getLiveChartHtml(array $rangeSpec, array $filters, array $ids) {
+        $today = date('Y-m-d');
+        $out = [];
+        foreach($ids as $id) {
+            if($id === 'daily') {
+                $out['daily'] = $this->renderLineChart($this->getDailySeries($rangeSpec, $filters), 'views', 'Traffic trend by day', [], 'daily');
+            } elseif($id === 'hourly') {
+                $hourlyDay = (string) ($rangeSpec['end_date'] ?? $today);
+                $out['hourly'] = $this->renderLineChart($this->getHourlySeries($hourlyDay, $filters), 'views', 'Traffic by hour for selected day', [], 'hourly');
+            } elseif($id === 'events') {
+                $out['events'] = $this->renderLineChart($this->getEventDailySeries($rangeSpec, $filters), 'views', 'Tracked actions by day', [], 'events');
+            } elseif($id === 'goals') {
+                $out['goals'] = $this->renderLineChart($this->getGoalDailySeries($rangeSpec, $filters), 'views', 'Goal conversions by day', ['views' => 'Conversions', 'uniques' => 'Unique visitors', 'sessions' => 'Sessions'], 'goals');
+            }
+        }
+        return $out;
+    }
+
     public function getHealthSnapshot() {
         $db = $this->wire('database');
         $snapshot = [
@@ -4103,17 +4199,40 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
         return $html;
     }
 
-    public function renderLineChart(array $series, $metric = 'views', $chartLabel = 'Analytics chart', array $metricLabels = []) {
-        $metric = in_array($metric, ['views', 'uniques', 'sessions'], true) ? $metric : 'views';
-        $metricLabels = array_merge(['views' => 'Views', 'uniques' => 'Uniques', 'sessions' => 'Sessions'], $metricLabels);
-        if(!$series) return '<p>No data yet.</p>';
-
+    /**
+     * Single source of truth for line-chart layout geometry. Shared by
+     * renderLineChart() (server render) and the live-update script (client
+     * relayout) so the two cannot drift.
+     *
+     * @return array{width:int,height:int,padX:int,padY:int,plotWidth:int,plotHeight:int}
+     */
+    public function getChartGeometry() {
         $width = 920;
         $height = 260;
         $padX = 40;
         $padY = 20;
-        $plotWidth = $width - ($padX * 2);
-        $plotHeight = $height - ($padY * 2) - 24;
+        return [
+            'width' => $width,
+            'height' => $height,
+            'padX' => $padX,
+            'padY' => $padY,
+            'plotWidth' => $width - ($padX * 2),
+            'plotHeight' => $height - ($padY * 2) - 24,
+        ];
+    }
+
+    public function renderLineChart(array $series, $metric = 'views', $chartLabel = 'Analytics chart', array $metricLabels = [], $liveId = '') {
+        $metric = in_array($metric, ['views', 'uniques', 'sessions'], true) ? $metric : 'views';
+        $metricLabels = array_merge(['views' => 'Views', 'uniques' => 'Uniques', 'sessions' => 'Sessions'], $metricLabels);
+        if(!$series) return '<p>No data yet.</p>';
+
+        $geom = $this->getChartGeometry();
+        $width = $geom['width'];
+        $height = $geom['height'];
+        $padX = $geom['padX'];
+        $padY = $geom['padY'];
+        $plotWidth = $geom['plotWidth'];
+        $plotHeight = $geom['plotHeight'];
         $max = 1;
         foreach($series as $row) $max = max($max, (int) ($row[$metric] ?? 0));
 
@@ -4131,7 +4250,8 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
 
             $label = (string) ($row['label'] ?? (isset($row['day']) ? $this->formatDisplayDate($row['day']) : ''));
             $timeLabel = (string) ($row['time_label'] ?? (isset($row['hour']) ? sprintf('%02d:00–%02d:59', (int) $row['hour'], (int) $row['hour']) : ''));
-            $circles[] = '<circle class="pwna-point" cx="' . $x . '" cy="' . $y . '" r="4" data-label="' . $sanitizer->entities($label) . '" data-time="' . $sanitizer->entities($timeLabel) . '" data-views="' . (int) ($row['views'] ?? 0) . '" data-uniques="' . (int) ($row['uniques'] ?? 0) . '" data-sessions="' . (int) ($row['sessions'] ?? 0) . '"></circle>';
+            $slotKey = isset($row['hour']) ? (string) (int) $row['hour'] : (string) ($row['day'] ?? $index);
+            $circles[] = '<circle class="pwna-point" data-key="' . $sanitizer->entities($slotKey) . '" cx="' . $x . '" cy="' . $y . '" r="4" data-label="' . $sanitizer->entities($label) . '" data-time="' . $sanitizer->entities($timeLabel) . '" data-views="' . (int) ($row['views'] ?? 0) . '" data-uniques="' . (int) ($row['uniques'] ?? 0) . '" data-sessions="' . (int) ($row['sessions'] ?? 0) . '"></circle>';
         }
 
         $first = reset($series);
@@ -4139,15 +4259,23 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
         $firstLabel = isset($first['hour']) ? '00:00' : $this->formatDisplayDate($first['day']);
         $lastLabel = isset($last['hour']) ? '23:00' : $this->formatDisplayDate($last['day']);
 
-        $html  = '<div class="pwna-chart-wrap">';
+        $liveAttr = '';
+        if($liveId !== '') {
+            $lastRow = end($series);
+            $dayStamp = is_array($lastRow) && isset($lastRow['day']) ? (string) $lastRow['day'] : '';
+            $liveAttr = ' data-pwna-chart-live="' . $sanitizer->entities($liveId) . '" data-pwna-day="' . $sanitizer->entities($dayStamp) . '"';
+        }
+        $html  = '<div class="pwna-chart-wrap"' . $liveAttr . '>';
         $html .= '<svg class="pwna-chart" viewBox="0 0 ' . $width . ' ' . $height . '" role="img" aria-label="' . $sanitizer->entities($chartLabel) . '">';
         $html .= '<line x1="' . $padX . '" y1="' . ($padY + $plotHeight) . '" x2="' . ($padX + $plotWidth) . '" y2="' . ($padY + $plotHeight) . '" class="pwna-axis" />';
         $html .= '<line x1="' . $padX . '" y1="' . $padY . '" x2="' . $padX . '" y2="' . ($padY + $plotHeight) . '" class="pwna-axis" />';
         for($i = 0; $i <= 4; $i++) {
             $v = (int) round(($max / 4) * $i);
             $y = $padY + $plotHeight - (($v / $max) * $plotHeight);
-            $html .= '<line x1="' . $padX . '" y1="' . round($y, 2) . '" x2="' . ($padX + $plotWidth) . '" y2="' . round($y, 2) . '" class="pwna-grid" />';
-            $html .= '<text x="8" y="' . (round($y, 2) + 4) . '" class="pwna-label">' . $v . '</text>';
+            $gridAttr = $liveId !== '' ? ' data-pwna-grid="' . $i . '"' : '';
+            $labelAttr = $liveId !== '' ? ' data-pwna-grid-label="' . $i . '"' : '';
+            $html .= '<line x1="' . $padX . '" y1="' . round($y, 2) . '" x2="' . ($padX + $plotWidth) . '" y2="' . round($y, 2) . '" class="pwna-grid"' . $gridAttr . ' />';
+            $html .= '<text x="8" y="' . (round($y, 2) + 4) . '" class="pwna-label"' . $labelAttr . '>' . $v . '</text>';
         }
         $html .= '<polyline fill="none" class="pwna-line" points="' . implode(' ', $points) . '" />';
         $html .= implode('', $circles);

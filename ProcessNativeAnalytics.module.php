@@ -258,8 +258,8 @@ public function ___execute() {
     $overviewContent = $this->renderToolbar($rangeMeta, $pageId, $template, $templates, 'overview');
     $overviewContent .= $this->renderCards($summary, $current, $summary404, $quality);
     $overviewContent .= '<div class="pwna-grid-2">';
-    $overviewContent .= '<div class="pwna-panel"><h2>Traffic trend</h2><p class="pwna-note">Daily totals for the selected period.</p>' . $analytics->renderLineChart($series, 'views', 'Traffic trend by day') . '</div>';
-    $overviewContent .= '<div class="pwna-panel"><h2>Traffic by hour</h2><p class="pwna-note">Hover a point to see the hour, views, uniques and sessions for the last day in the selected range.</p>' . $analytics->renderLineChart($hourlySeries, 'views', 'Traffic by hour for selected day') . '</div>';
+    $overviewContent .= '<div class="pwna-panel"><h2>Traffic trend</h2><p class="pwna-note">Daily totals for the selected period.</p>' . $analytics->renderLineChart($series, 'views', 'Traffic trend by day', [], 'daily') . '</div>';
+    $overviewContent .= '<div class="pwna-panel"><h2>Traffic by hour</h2><p class="pwna-note">Hover a point to see the hour, views, uniques and sessions for the last day in the selected range.</p>' . $analytics->renderLineChart($hourlySeries, 'views', 'Traffic by hour for selected day', [], 'hourly') . '</div>';
     $overviewContent .= '</div>';
     $overviewContent .= '<div class="pwna-grid-2">';
     $overviewContent .= $this->renderSimpleTable('Top pages', ['Page', 'Views', 'Uniques', 'Sessions'], $this->mapTopPages($pages), true);
@@ -274,7 +274,7 @@ public function ___execute() {
     $compareContent .= $this->renderComparePanel($analytics, $rangeMeta, $compareMeta, $summary, $compareSummary, $quality, $compareQuality, $summary404, $compareSummary404, $series, $compareSeries, $pageId, $template, $templates);
 
     $engagementMetricsContent = $this->renderEventCards($eventSummary, $eventFormSummary, $eventDownloadSummary, $eventContactSummary, $eventNavigationSummary);
-    $engagementMetricsContent .= '<div class="pwna-panel"><h2>Engagement trend</h2><p class="pwna-note">Tracked actions over time for the selected period.</p>' . $analytics->renderLineChart($eventSeries, 'views', 'Tracked actions by day') . '</div>';
+    $engagementMetricsContent .= '<div class="pwna-panel"><h2>Engagement trend</h2><p class="pwna-note">Tracked actions over time for the selected period.</p>' . $analytics->renderLineChart($eventSeries, 'views', 'Tracked actions by day', [], 'events') . '</div>';
     $engagementMetricsContent .= '<div class="pwna-grid-2">';
     $engagementMetricsContent .= $this->renderSimpleTable('Top tracked actions', ['Action', 'Events', 'Unique visitors', 'Sessions'], $this->mapEventRows($topEvents), true);
     $engagementMetricsContent .= $this->renderSimpleTable('Top action targets', ['Target', 'Group', 'Events', 'Sessions'], $this->mapEventTargetRows($topEventTargets), true);
@@ -1449,7 +1449,7 @@ protected function renderGoalTrendPanel(NativeAnalytics $analytics, array $goalS
     }
 
     $out .= '<p class="pwna-note">Daily goal completions for active goals in the selected period.</p>';
-    $out .= $analytics->renderLineChart($goalSeries, 'views', 'Goal conversions by day', ['views' => 'Conversions', 'uniques' => 'Unique visitors', 'sessions' => 'Sessions']);
+    $out .= $analytics->renderLineChart($goalSeries, 'views', 'Goal conversions by day', ['views' => 'Conversions', 'uniques' => 'Unique visitors', 'sessions' => 'Sessions'], 'goals');
     $out .= '</div>';
     return $out;
 }
@@ -1970,7 +1970,7 @@ if(document.readyState === "loading") { document.addEventListener("DOMContentLoa
 }
 
 protected function renderChartTooltipScript() {
-    return '<script' . $this->getScriptNonceAttribute() . '>(function(){function init(){document.querySelectorAll(".pwna-chart-wrap").forEach(function(wrap){var tip=wrap.querySelector(".pwna-chart-tooltip");if(!tip||wrap.dataset.pwnaTipInit==="1")return;wrap.dataset.pwnaTipInit="1";var dayEl=tip.querySelector(".pwna-chart-tooltip-day");var timeEl=tip.querySelector(".pwna-chart-tooltip-time");var viewsEl=tip.querySelector("[data-pwna-tip=views]");var uniquesEl=tip.querySelector("[data-pwna-tip=uniques]");var sessionsEl=tip.querySelector("[data-pwna-tip=sessions]");var compareWrap=tip.querySelector(".pwna-chart-tooltip-compare");var compareDay=tip.querySelector("[data-pwna-tip=compare-day]");var compareViews=tip.querySelector("[data-pwna-tip=compare-views]");var compareUniques=tip.querySelector("[data-pwna-tip=compare-uniques]");var compareSessions=tip.querySelector("[data-pwna-tip=compare-sessions]");function place(ev){var rect=wrap.getBoundingClientRect();var x=(ev.clientX-rect.left)+14;var y=(ev.clientY-rect.top)-12;var maxX=Math.max(8, rect.width-tip.offsetWidth-8);var maxY=Math.max(8, rect.height-tip.offsetHeight-8);tip.style.left=Math.max(8, Math.min(x, maxX))+"px";tip.style.top=Math.max(8, Math.min(y, maxY))+"px";}function activate(point,ev){wrap.querySelectorAll(".pwna-point.is-active").forEach(function(el){el.classList.remove("is-active");});point.classList.add("is-active");dayEl.textContent=point.getAttribute("data-label")||"";var timeText=point.getAttribute("data-time")||"";timeEl.textContent=timeText;timeEl.hidden=!timeText;viewsEl.textContent=point.getAttribute("data-views")||"0";uniquesEl.textContent=point.getAttribute("data-uniques")||"0";sessionsEl.textContent=point.getAttribute("data-sessions")||"0";var hasCompare=point.hasAttribute("data-compare-label");if(compareWrap){compareWrap.hidden=!hasCompare;if(hasCompare){compareDay.textContent=point.getAttribute("data-compare-label")||"";compareViews.textContent=point.getAttribute("data-compare-views")||"0";compareUniques.textContent=point.getAttribute("data-compare-uniques")||"0";compareSessions.textContent=point.getAttribute("data-compare-sessions")||"0";}}tip.hidden=false;place(ev);}wrap.querySelectorAll(".pwna-point").forEach(function(point){point.addEventListener("mouseenter", function(ev){activate(point,ev);});point.addEventListener("mousemove", function(ev){place(ev);});});wrap.addEventListener("mouseleave", function(){wrap.querySelectorAll(".pwna-point.is-active").forEach(function(el){el.classList.remove("is-active");});tip.hidden=true;});});}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded", init);}else{init();}})();</script>';
+    return '<script' . $this->getScriptNonceAttribute() . '>(function(){function init(){document.querySelectorAll(".pwna-chart-wrap").forEach(function(wrap){var tip=wrap.querySelector(".pwna-chart-tooltip");if(!tip||wrap.dataset.pwnaTipInit==="1")return;wrap.dataset.pwnaTipInit="1";var dayEl=tip.querySelector(".pwna-chart-tooltip-day");var timeEl=tip.querySelector(".pwna-chart-tooltip-time");var viewsEl=tip.querySelector("[data-pwna-tip=views]");var uniquesEl=tip.querySelector("[data-pwna-tip=uniques]");var sessionsEl=tip.querySelector("[data-pwna-tip=sessions]");var compareWrap=tip.querySelector(".pwna-chart-tooltip-compare");var compareDay=tip.querySelector("[data-pwna-tip=compare-day]");var compareViews=tip.querySelector("[data-pwna-tip=compare-views]");var compareUniques=tip.querySelector("[data-pwna-tip=compare-uniques]");var compareSessions=tip.querySelector("[data-pwna-tip=compare-sessions]");function place(ev){var rect=wrap.getBoundingClientRect();var x=(ev.clientX-rect.left)+14;var y=(ev.clientY-rect.top)-12;var maxX=Math.max(8, rect.width-tip.offsetWidth-8);var maxY=Math.max(8, rect.height-tip.offsetHeight-8);tip.style.left=Math.max(8, Math.min(x, maxX))+"px";tip.style.top=Math.max(8, Math.min(y, maxY))+"px";}function activate(point,ev){wrap.querySelectorAll(".pwna-point.is-active").forEach(function(el){el.classList.remove("is-active");});point.classList.add("is-active");dayEl.textContent=point.getAttribute("data-label")||"";var timeText=point.getAttribute("data-time")||"";timeEl.textContent=timeText;timeEl.hidden=!timeText;viewsEl.textContent=point.getAttribute("data-views")||"0";uniquesEl.textContent=point.getAttribute("data-uniques")||"0";sessionsEl.textContent=point.getAttribute("data-sessions")||"0";var hasCompare=point.hasAttribute("data-compare-label");if(compareWrap){compareWrap.hidden=!hasCompare;if(hasCompare){compareDay.textContent=point.getAttribute("data-compare-label")||"";compareViews.textContent=point.getAttribute("data-compare-views")||"0";compareUniques.textContent=point.getAttribute("data-compare-uniques")||"0";compareSessions.textContent=point.getAttribute("data-compare-sessions")||"0";}}tip.hidden=false;place(ev);}wrap.querySelectorAll(".pwna-point").forEach(function(point){point.addEventListener("mouseenter", function(ev){activate(point,ev);});point.addEventListener("mousemove", function(ev){place(ev);});});wrap.addEventListener("mouseleave", function(){wrap.querySelectorAll(".pwna-point.is-active").forEach(function(el){el.classList.remove("is-active");});tip.hidden=true;});});}window.__pwnaInitChartTooltips=init;if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded", init);}else{init();}})();</script>';
 }
 
         protected function renderAutoRefreshScript(array $rangeMeta, $minutes, $pageId, $template) {
@@ -1988,6 +1988,7 @@ protected function renderChartTooltipScript() {
             'canBlock' => $this->user->hasPermission('nativeanalytics-manage'),
             'csrfName' => $this->session->CSRF->getTokenName(),
             'csrfValue' => $this->session->CSRF->getTokenValue(),
+            'chartGeom' => $analytics->getChartGeometry(),
         ];
         $json = json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT);
         if($json === false) $json = '{}';
@@ -2079,7 +2080,87 @@ protected function renderChartTooltipScript() {
       });
     });
   }
-  function refresh() {
+  function chartNum(v) { var n = Number(v); return isFinite(n) ? n : 0; }
+  function round2(n) { return Math.round(n * 100) / 100; }
+  function readSlots(wrap) {
+    var out = [];
+    wrap.querySelectorAll('circle.pwna-point').forEach(function(c) {
+      out.push({
+        key: c.getAttribute('data-key'),
+        label: c.getAttribute('data-label') || '',
+        views: chartNum(c.getAttribute('data-views')),
+        uniques: chartNum(c.getAttribute('data-uniques')),
+        sessions: chartNum(c.getAttribute('data-sessions'))
+      });
+    });
+    return out;
+  }
+  function layoutChart(wrap, slots) {
+    var g = cfg.chartGeom;
+    if(!g) return;
+    var svg = wrap.querySelector('svg.pwna-chart');
+    if(!svg) return;
+    var max = 1;
+    slots.forEach(function(s) { if(s.views > max) max = s.views; });
+    var count = slots.length;
+    var circles = svg.querySelectorAll('circle.pwna-point');
+    var pts = [];
+    slots.forEach(function(s, i) {
+      var x = g.padX + (count > 1 ? (g.plotWidth / (count - 1)) * i : g.plotWidth / 2);
+      var y = g.padY + g.plotHeight - (s.views / max) * g.plotHeight;
+      x = round2(x); y = round2(y);
+      pts.push(x + ',' + y);
+      var c = circles[i];
+      if(c) {
+        c.setAttribute('cx', x);
+        c.setAttribute('cy', y);
+        c.setAttribute('data-key', s.key);
+        c.setAttribute('data-label', s.label);
+        c.setAttribute('data-views', s.views);
+        c.setAttribute('data-uniques', s.uniques);
+        c.setAttribute('data-sessions', s.sessions);
+      }
+    });
+    var line = svg.querySelector('.pwna-line');
+    if(line) line.setAttribute('points', pts.join(' '));
+    var grids = svg.querySelectorAll('[data-pwna-grid]');
+    var glabels = svg.querySelectorAll('[data-pwna-grid-label]');
+    for(var i = 0; i <= 4; i++) {
+      var v = Math.round((max / 4) * i);
+      var gy = round2(g.padY + g.plotHeight - (v / max) * g.plotHeight);
+      if(grids[i]) { grids[i].setAttribute('y1', gy); grids[i].setAttribute('y2', gy); }
+      if(glabels[i]) { glabels[i].setAttribute('y', gy + 4); glabels[i].textContent = v; }
+    }
+  }
+  function updateCharts(chartLatest) {
+    if(!chartLatest) return;
+    var rollover = [];
+    document.querySelectorAll('[data-pwna-chart-live]').forEach(function(wrap) {
+      var id = wrap.getAttribute('data-pwna-chart-live');
+      var latest = chartLatest[id];
+      if(!latest) return;
+      var incomingDay = (id === 'hourly') ? latest.day : String(latest.key);
+      var renderedDay = wrap.getAttribute('data-pwna-day');
+      if(renderedDay !== null && incomingDay != null && String(incomingDay) !== String(renderedDay)) {
+        rollover.push(id);
+        return;
+      }
+      var slots = readSlots(wrap);
+      var matchKey = String(latest.key);
+      for(var i = 0; i < slots.length; i++) {
+        if(String(slots[i].key) === matchKey) {
+          slots[i].views = chartNum(latest.views);
+          slots[i].uniques = chartNum(latest.uniques);
+          slots[i].sessions = chartNum(latest.sessions);
+          if(latest.label) slots[i].label = latest.label;
+          layoutChart(wrap, slots);
+          break;
+        }
+      }
+    });
+    refetchCharts(rollover);
+  }
+  function buildUrl() {
     var url = new URL(cfg.endpoint, window.location.origin);
     url.searchParams.set('range_days', String(cfg.rangeDays));
     url.searchParams.set('minutes', String(cfg.minutes));
@@ -2087,12 +2168,38 @@ protected function renderChartTooltipScript() {
     if(cfg.toDate) url.searchParams.set('to_date', cfg.toDate);
     if(cfg.pageId > 0) url.searchParams.set('page_id', String(cfg.pageId));
     if(cfg.template) url.searchParams.set('template', cfg.template);
+    return url;
+  }
+  function refetchCharts(ids) {
+    if(!ids.length) return;
+    var url = buildUrl();
+    url.searchParams.set('render_charts', ids.join(','));
     fetch(url.toString(), { credentials: 'same-origin' })
+      .then(function(r) { return r.ok ? r.json() : null; })
+      .then(function(data) {
+        if(!data || !data.chartHtml) return;
+        ids.forEach(function(id) {
+          var html = data.chartHtml[id];
+          var oldWrap = document.querySelector('[data-pwna-chart-live="' + id + '"]');
+          if(!html || !oldWrap) return;
+          var tmp = document.createElement('div');
+          tmp.innerHTML = html;
+          var newWrap = tmp.querySelector('[data-pwna-chart-live]');
+          if(!newWrap) return;
+          oldWrap.parentNode.replaceChild(newWrap, oldWrap);
+          if(window.__pwnaInitChartTooltips) window.__pwnaInitChartTooltips();
+        });
+      })
+      .catch(function(){});
+  }
+  function refresh() {
+    fetch(buildUrl().toString(), { credentials: 'same-origin' })
       .then(function(r) { return r.ok ? r.json() : null; })
       .then(function(data) {
         if(!data || data.ok === false) return;
         updateCards(data);
         renderCurrent(data.currentVisitors || []);
+        updateCharts(data.chartLatest);
       })
       .catch(function(){});
   }
