@@ -1,10 +1,10 @@
-NativeAnalytics 1.0.30
+NativeAnalytics 1.0.31
 
 # NativeAnalytics
 
 Native first-party analytics module for ProcessWire CMS. It tracks traffic and engagement directly inside ProcessWire, without Google Analytics or external APIs.
 
-## Features in v1.0.30
+## Features in v1.0.31
 
 NativeAnalytics is a first-party analytics dashboard for ProcessWire. It keeps the tracking data inside your ProcessWire installation and does not rely on Google Analytics, external tracking scripts or remote analytics APIs.
 
@@ -12,6 +12,8 @@ Main features currently included:
 
 - Page views, unique visitors, sessions and current visitors
 - Top pages, landing pages, exit pages, referrers and UTM campaign reporting
+- First-touch session attribution with acquisition channel breakdown (Direct, Organic Search, Social, Referral, Paid, Email, Affiliate, Campaign)
+- Conversion funnel tab with mixed page-path and event steps, per-step drop-off and overall completion rate
 - Browser, device and operating-system breakdowns
 - Internal search-term tracking via configurable query parameters (`q`, `s`, `search` by default)
 - Smarter 404 reporting with support for redirect/history modules, so renamed pages and redirected URLs do not stay listed as real 404s
@@ -30,11 +32,13 @@ Main features currently included:
 - Tracking helper with copy-ready snippets and a mini snippet generator
 - Per-page mini analytics box inside `ProcessPageEdit`
 - CSV, PDF and DOCX exports
-- Optional monthly email reports with configurable recipients, report sections and PDF attachment
+- Optional monthly email reports with configurable recipients, report sections (including acquisition channels) and PDF attachment
 - Server-side pageview tracking with optional event JS tracking, bot filtering and optional consent cookie gate
 - Cookie-less visitor/session storage mode for EU/privacy-focused sites
 - PrivacyWire localStorage consent helper
 - Cleaner, grouped module settings with collapsible sections for tracking, filters, bot detection, privacy/consent, retention, reports and advanced options
+- Data retention with automatic daily cleanup, disk-space reclaim (OPTIMIZE TABLE), a storage-status panel and manual purge/reclaim buttons
+- Configurable dashboard auto-refresh that pauses while the browser tab is hidden, with a live-status indicator
 
 ## Installation
 
@@ -65,7 +69,7 @@ This version already covers the core analytics needs for most ProcessWire sites:
 
 ## Optional future upgrades
 
-- Funnel reports across multiple goals
+- Funnel reports chained across multiple goals
 - Alerts for traffic spikes or drops
 - Page-level engagement score
 - Multi-site analytics (per-site dashboards inside a multi-site ProcessWire install)
@@ -248,6 +252,50 @@ Thanks to **[adrianbj](https://github.com/adrianbj)** for all five improvements 
 
 - **Fixed the tracking endpoint being recorded as a pageview.** On some setups (ProcessWire installed in a subdirectory, behind a reverse proxy, or where the `/pwna-track/` request was not recognised as the analytics endpoint) the endpoint's own path could leak into stored hits. The result was that **Top pages**, **Top landing pages** and **Top exit pages** all showed only `/pwna-track/`, with sessions started equal to sessions ended. A new `isEndpointPath()` guard now hard-excludes `/pwna-track/` and `/pwna-realtime/` from being stored as a pageview or event, and the `getRequestPathForStorage()` fallback can no longer return an endpoint path. Existing `/pwna-track/` rows can be cleaned up via the suspicious-path removal tool.
 - Updated module version metadata to `1.0.27` / integer `1027`.
+
+## 1.0.31 notes
+
+### Data retention & disk space
+- Added a **"Reclaim disk space after cleanup"** option (on by default). After the daily retention purge, the analytics tables are rebuilt (`OPTIMIZE TABLE`, at most weekly) so freed space is actually returned to the filesystem — InnoDB does not shrink the database file on `DELETE` alone.
+- Added a **storage status panel** to the module settings: per-table row counts and on-disk size for all `pwna_*` tables, plus last-cleanup and last-reclaim timestamps.
+- Added manual **"Purge old data now"** and **"Reclaim disk space now"** buttons (CSRF-protected, superuser / `nativeanalytics-manage` only).
+- Clarified the retention setting descriptions (what is deleted, what is kept, when).
+
+### Acquisition & campaigns
+- Added **first-touch session attribution** (new `pwna_attribution` table). Each session is attributed once, on its first hit, to the channel/campaign that originally brought the visitor — so later pageviews and conversions in the session no longer lose their source.
+- Added a **channel classifier**: Direct / Organic Search / Social / Referral / Paid / Email / Affiliate / Campaign (UTM medium/source first, then referrer host, no external dependencies).
+- Sources tab: new **"Channels (first-touch sessions)"** and **"Campaigns (first-touch sessions)"** tables alongside the existing per-hit campaign table.
+- Added **`utm_term` and `utm_content`** capture on both tracking paths (server-side and JS); `utm_content` is now part of the campaign breakdown.
+- Monthly email report: optional **"Channels (first-touch sessions)"** section in the HTML, plain-text and PDF formats (new toggle, on by default).
+
+### Conversion funnel (new dashboard tab)
+- New **Funnel** tab: define an ordered funnel (up to 8 steps, one per line) and see how many sessions progress from step to step within the selected date range.
+- **Page steps** (`/exact/path/` or `/section/*` prefix) and **event steps** (`event:group`, `event:group/name`, `event:group/name/label`) can be mixed freely; `Label = <spec>` sets a custom label.
+- Sequential semantics: a session counts for a step only if it reached it after the previous step (first-occurrence times, merged across hits and events per session).
+- Bar chart with per-step drop-off, "% continued from previous", a summary table and the overall completion rate. The definition is saved and survives reloads and module-settings saves.
+
+### Dashboard
+- Auto-refresh is now **configurable** ("Dashboard auto-refresh (seconds)", `0` disables, 5–300 s range) and **pauses while the browser tab is hidden**, resuming with an immediate refresh on return — significantly less server load from background tabs.
+- Added a **live-status indicator** next to "Current visitors" (Live / Paused (tab hidden) / Update failed).
+
+### Performance
+- Added composite index `pwna_hits (is_bot, created_at)` — serves virtually every dashboard report and daily-aggregate rebuild (equality column first, range second).
+- Added composite index `pwna_hits (ip_hash, created_date, created_hour)` — serves the behavioral bot detector and IP-based cleanup deletes; the hits table previously had **no** `ip_hash` index at all.
+- Added composite index `pwna_events (is_bot, created_at)` for event reports.
+- Indexes are added automatically on first load after the update (online DDL; the one-time build may take a moment on very large tables).
+
+### Library
+- Updated the bundled **matomo/device-detector 6.4.2 → 6.5.1** (newest device, browser and bot definitions). A site-wide Composer install still takes precedence, and manually replacing `lib/matomo-device-detector/` remains supported, as before.
+
+### Fixes
+- Fixed **SQLSTATE HY000 2014 "Cannot execute queries while other unbuffered queries are active"** when running the disk-reclaim maintenance action (`OPTIMIZE TABLE` returns a result set that must be consumed and closed).
+- Fixed the dashboard funnel definition (and other runtime-saved values) being **wiped when saving module settings** — all runtime-persisted config keys now have matching hidden fields in the config form.
+- New funnel, live-status and badge styles now use the module's theme variables (`--pwna-*` / `light-dark()`), fixing unreadable text in **Konkat** and other dark admin themes.
+
+### Upgrade notes
+- All schema changes (new columns, the new attribution table, new indexes) are applied automatically on the first load after the update.
+- Attribution data is collected from the moment of the update onward; earlier sessions are not retroactively attributed.
+- Updated module version metadata to `1.0.31` / integer `1031` for both NativeAnalytics and the dashboard process module.
 
 ## 1.0.30 notes
 

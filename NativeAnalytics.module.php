@@ -67,7 +67,7 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
     public static function getModuleInfo() {
         return [
             'title' => 'NativeAnalytics',
-            'summary' => 'Native first-party analytics dashboard for ProcessWire with traffic, compare, exports, event tracking and goals.',
+            'summary' => 'Native first-party analytics dashboard for ProcessWire with traffic, acquisition channels, funnels, compare, exports, event tracking and goals.',
             'version' => 1031,
             'author' => 'Pyxios - Roych (www.pyxios.com)',
             'href' => 'https://processwire.com/talk/topic/31808-native-analytics-%E2%80%94-a-native-analytics-module-for-processwire/',
