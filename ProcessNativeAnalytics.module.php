@@ -205,6 +205,8 @@ public function ___execute() {
     $referrers = $analytics->getTopReferrers($rangeSpec, 10, $filters);
     $searchTerms = $analytics->getTopSearchTerms($rangeSpec, 10, $filters);
     $campaigns = $analytics->getTopCampaigns($rangeSpec, 10, $filters);
+    $channels = $analytics->getTopChannels($rangeSpec, 12, $filters);
+    $attributedCampaigns = $analytics->getAttributedCampaigns($rangeSpec, 10, $filters);
     $browsers = $analytics->getBreakdown('browser', $rangeSpec, 10, $filters);
     $devices = $analytics->getBreakdown('device_type', $rangeSpec, 10, $filters);
     $os = $analytics->getBreakdown('os', $rangeSpec, 10, $filters);
@@ -297,7 +299,14 @@ public function ___execute() {
     $goalsContent .= '</div>';
     $goalsContent .= $this->renderGoalBuilderPanel($analytics, $goalStats, $goalSuggestions);
 
+    $funnelContent = $this->renderToolbar($rangeMeta, $pageId, $template, $templates, 'funnel');
+    $funnelContent .= $this->renderFunnelPanel($analytics, $rangeSpec, $filters);
+
     $sourcesContent = $this->renderToolbar($rangeMeta, $pageId, $template, $templates, 'sources');
+    $sourcesContent .= '<div class="pwna-grid-2">';
+    $sourcesContent .= $this->renderSimpleTable('Channels (first-touch sessions)', ['Channel', 'Sessions', 'Unique visitors'], $this->mapSessionRows($channels));
+    $sourcesContent .= $this->renderSimpleTable('Campaigns (first-touch sessions)', ['Campaign', 'Sessions', 'Unique visitors'], $this->mapSessionRows($attributedCampaigns));
+    $sourcesContent .= '</div>';
     $sourcesContent .= '<div class="pwna-grid-2">';
     $sourcesContent .= $this->renderSimpleTable('Top referrers', ['Referrer', 'Views'], $this->mapGenericRows($referrers, 'referrer_host'), true);
     $sourcesContent .= $this->renderSimpleTable('Internal search terms', ['Search term', 'Views'], $this->mapGenericRows($searchTerms, 'search_term'));
@@ -323,6 +332,7 @@ public function ___execute() {
         'overview' => $overviewContent,
         'engagement' => $engagementContent,
         'goals' => $goalsContent,
+        'funnel' => $funnelContent,
         'compare' => $compareContent,
         'sources' => $sourcesContent,
         'tech' => $techContent,
@@ -712,6 +722,10 @@ startxref
         if($action === 'delete_goal') {
             $analytics->deleteGoal((int) $this->input->post('goal_id'));
             $this->warning('Goal deleted.');
+        }
+        if($action === 'save_funnel') {
+            $analytics->saveFunnelSteps((string) $this->input->post('funnel_steps'));
+            $this->message('Funnel updated.');
         }
         if($action === 'rebuild_today') {
             $day = date('Y-m-d');
@@ -1295,6 +1309,7 @@ public function ___getTabLabels() {
         'overview' => 'Overview',
         'engagement' => 'Engagement',
         'goals' => 'Goals',
+        'funnel' => 'Funnel',
         'compare' => 'Compare',
         'sources' => 'Sources',
         'tech' => 'System',
@@ -1543,8 +1558,83 @@ protected function describeGoalRule(array $goal) {
     return implode('<br>', $parts);
 }
 
-protected function renderGoalBuilderPanel(NativeAnalytics $analytics, array $goals, array $suggestions = []) {
-    if(!$this->user->hasPermission('nativeanalytics-manage')) {
+protected function renderFunnelPanel(NativeAnalytics $analytics, $rangeSpec, array $filters) {
+    $raw = (string) $analytics->funnelSteps;
+    $steps = $analytics->parseFunnelSteps($raw);
+    $csrfName = $this->session->CSRF->getTokenName();
+    $csrfValue = $this->session->CSRF->getTokenValue();
+
+    $out = '<div class="pwna-panel"><h2>Conversion funnel</h2>';
+    $out .= '<p class="pwna-note">Define an ordered list of steps — one per line — to see how many sessions move from one step to the next within the selected date range. A session counts for a step only if it reached it after the previous step. The date range above applies; the page/template filters do not.</p>';
+
+    // Definition form
+    $out .= '<form method="post" class="pwna-funnel-form">';
+    $out .= '<input type="hidden" name="' . $this->sanitizer->entities($csrfName) . '" value="' . $this->sanitizer->entities($csrfValue) . '">';
+    $out .= '<input type="hidden" name="pwna_action" value="save_funnel">';
+    $out .= '<label class="pwna-field pwna-span-all"><span>Funnel steps</span>';
+    $out .= '<textarea name="funnel_steps" rows="6" class="pwna-funnel-input" placeholder="/&#10;Product page = /shop/*&#10;event:cta/add_to_cart&#10;Thank you = /checkout/thank-you/">' . $this->sanitizer->entities($raw) . '</textarea>';
+    $out .= '<small class="pwna-field-help">One step per line. Page steps: <code>/exact/path/</code> or <code>/section/*</code> (prefix). Event steps: <code>event:group</code>, <code>event:group/name</code> or <code>event:group/name/label</code>. Prefix any line with <code>Label = </code> for a custom label. Page and event steps can be mixed. Up to 8 steps.</small></label>';
+    $out .= '<div class="pwna-funnel-actions"><button type="submit" class="ui-button">Save &amp; run funnel</button></div>';
+    $out .= '</form>';
+
+    if(count($steps) < 2) {
+        $out .= '<p class="pwna-empty">Add at least two steps above to build a funnel.</p></div>';
+        return $out;
+    }
+
+    $report = $analytics->getFunnelReport($steps, $rangeSpec, $filters);
+    $rows = $report['steps'] ?? [];
+    $entered = (int) ($report['entered'] ?? 0);
+
+    if($entered === 0) {
+        $out .= '<p class="pwna-empty">No sessions matched the first step in this date range. Check the paths against your Top pages, and remember paths are stored without query strings when that option is enabled.</p></div>';
+        return $out;
+    }
+
+    $out .= '<div class="pwna-funnel-chart">';
+    $lastIndex = count($rows) - 1;
+    foreach($rows as $i => $row) {
+        $width = max(2, (float) ($row['conv_from_start'] ?? 0));
+        $stepNo = $i + 1;
+        $out .= '<div class="pwna-funnel-step">';
+        $badge = ((string) ($row['type'] ?? 'path') === 'event')
+            ? ' <span class="pwna-funnel-badge pwna-funnel-badge-event">event</span>'
+            : ' <span class="pwna-funnel-badge">page</span>';
+        $out .= '<div class="pwna-funnel-step-head"><span class="pwna-funnel-step-label"><strong>' . $stepNo . '.</strong> ' . $this->sanitizer->entities((string) $row['label']) . $badge . '</span>';
+        $out .= '<span class="pwna-funnel-step-meta">' . number_format((int) $row['sessions']) . ' sessions · ' . rtrim(rtrim((string) $row['conv_from_start'], '0'), '.') . '% of start</span></div>';
+        $out .= '<div class="pwna-funnel-bar-track"><div class="pwna-funnel-bar" style="width:' . $width . '%;"></div></div>';
+        if($i > 0) {
+            $drop = (int) $row['dropoff'];
+            $convPrev = rtrim(rtrim((string) $row['conv_from_prev'], '0'), '.');
+            $out .= '<div class="pwna-funnel-transition">' . $convPrev . '% continued from previous · ' . number_format($drop) . ' dropped off</div>';
+        }
+        $out .= '</div>';
+    }
+    $out .= '</div>';
+
+    // Summary table
+    $tableRows = [];
+    foreach($rows as $i => $row) {
+        $tableRows[] = [
+            '<strong>' . ($i + 1) . '.</strong> ' . $this->sanitizer->entities((string) $row['label']),
+            number_format((int) $row['sessions']),
+            rtrim(rtrim((string) $row['conv_from_start'], '0'), '.') . '%',
+            $i === 0 ? '—' : rtrim(rtrim((string) $row['conv_from_prev'], '0'), '.') . '%',
+            $i === 0 ? '—' : number_format((int) $row['dropoff']),
+        ];
+    }
+    $overall = $rows ? $rows[$lastIndex] : null;
+    if($overall) {
+        $out .= '<p class="pwna-note">Overall completion: <strong>' . rtrim(rtrim((string) $overall['conv_from_start'], '0'), '.') . '%</strong> of the '
+            . number_format($entered) . ' sessions that entered step 1 reached the final step.</p>';
+    }
+    $out .= $this->renderSimpleTable('Funnel steps', ['Step', 'Sessions', '% of start', '% from previous', 'Drop-off'], $tableRows);
+
+    $out .= '</div>';
+    return $out;
+}
+
+protected function renderGoalBuilderPanel(NativeAnalytics $analytics, array $goals, array $suggestions = []) {    if(!$this->user->hasPermission('nativeanalytics-manage')) {
         return '<div class="pwna-panel"><h2>Goal setup</h2><p class="pwna-note">You need the nativeanalytics-manage permission to create or edit goals.</p></div>';
     }
     $out = '<div class="pwna-panel pwna-helper-panel pwna-goal-builder-panel"><h2>Goal setup</h2>';
@@ -1864,7 +1954,7 @@ protected function renderHelpIcon($text, $label = 'Help', $extraClass = '') {
     }
 
     protected function renderCurrentVisitorsPanel(NativeAnalytics $analytics, array $rows, $minutes) {
-        $out = '<div class="pwna-panel" id="pwna-current-panel"><h2>Current visitors</h2>';
+        $out = '<div class="pwna-panel" id="pwna-current-panel"><h2>Current visitors <span id="pwna-live-status" class="pwna-live-status" data-state=""></span></h2>';
         $out .= '<p class="pwna-note" id="pwna-current-note">Active in the last ' . (int) $minutes . ' minutes.</p>';
         if(!$rows) {
             $out .= '<div id="pwna-current-body"><p class="pwna-empty">No active visitors right now.</p></div></div>';
@@ -2067,6 +2157,11 @@ protected function renderChartTooltipScript() {
             'csrfValue' => $this->session->CSRF->getTokenValue(),
             'chartGeometry' => $analytics->getChartGeometry(),
             'liveCharts' => ((string) $rangeMeta['fromDate'] === '' && (string) $rangeMeta['toDate'] === ''),
+            'refreshMs' => (function() use ($analytics) {
+                $secs = (int) $analytics->realtimeRefreshSeconds;
+                if($secs <= 0) return 0;
+                return max(5, min(300, $secs)) * 1000;
+            })(),
         ];
         $json = json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT);
         if($json === false) $json = '{}';
@@ -2209,14 +2304,37 @@ protected function renderChartTooltipScript() {
     if(cfg.template) url.searchParams.set('template', cfg.template);
     return url;
   }
+  function setLiveStatus(text, state) {
+    var el = document.getElementById('pwna-live-status');
+    if(!el) return;
+    el.textContent = text;
+    el.setAttribute('data-state', state || '');
+  }
   function refresh() {
     fetch(buildUrl().toString(), { credentials: 'same-origin' })
       .then(function(r){ return r.ok ? r.json() : null; })
-      .then(function(data){ if(!data || data.ok === false) return; updateCards(data); updateCharts(data.chartLatest || {}); renderCurrent(data.currentVisitors || []); })
-      .catch(function(){});
+      .then(function(data){
+        if(!data || data.ok === false) { setLiveStatus('Update failed', 'error'); return; }
+        updateCards(data); updateCharts(data.chartLatest || {}); renderCurrent(data.currentVisitors || []);
+        setLiveStatus(cfg.refreshMs > 0 ? 'Live · updated just now' : 'Updated just now', 'live');
+      })
+      .catch(function(){ setLiveStatus('Update failed', 'error'); });
   }
+
+  var refreshMs = Number(cfg.refreshMs || 0);
+  var timer = null;
+  function tick(){ if(!document.hidden) refresh(); }
+  function start(){ if(timer || refreshMs < 1000) return; timer = setInterval(tick, refreshMs); }
+  function stop(){ if(timer){ clearInterval(timer); timer = null; } }
+
   refresh();
-  setInterval(refresh, 10000);
+  if(refreshMs >= 1000) {
+    start();
+    document.addEventListener('visibilitychange', function(){
+      if(document.hidden){ stop(); setLiveStatus('Paused (tab hidden)', 'paused'); }
+      else { refresh(); start(); }
+    });
+  }
 })();
 </script>
 HTML;
@@ -2308,6 +2426,20 @@ HTML;
                 number_format((int) ($row['views'] ?? 0)),
                 number_format((int) ($row['uniques'] ?? 0)),
                 number_format((int) ($row['sessions'] ?? 0)),
+            ];
+        }
+        return $mapped;
+    }
+
+    protected function mapSessionRows(array $rows) {
+        $mapped = [];
+        foreach($rows as $row) {
+            $label = (string) ($row['label'] ?? '');
+            if($label === '') $label = '—';
+            $mapped[] = [
+                '<span class="pwna-break">' . $this->sanitizer->entities($label) . '</span>',
+                number_format((int) ($row['sessions'] ?? 0)),
+                number_format((int) ($row['uniques'] ?? 0)),
             ];
         }
         return $mapped;

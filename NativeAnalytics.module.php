@@ -4,7 +4,7 @@ require_once __DIR__ . '/lib/like-escape.php';
 
 class NativeAnalytics extends WireData implements Module, ConfigurableModule {
 
-    const VERSION = '1.0.30';
+    const VERSION = '1.0.31';
     const HITS_TABLE = 'pwna_hits';
     const DAILY_TABLE = 'pwna_daily';
     const SESSIONS_TABLE = 'pwna_sessions';
@@ -12,6 +12,7 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
     const EVENT_DAILY_TABLE = 'pwna_event_daily';
     const GOALS_TABLE = 'pwna_goals';
     const GOAL_DAILY_TABLE = 'pwna_goal_daily';
+    const ATTRIBUTION_TABLE = 'pwna_attribution';
     const CURRENT_VISITORS_FETCH_LIMIT = 1000;
 
     protected $defaults = [
@@ -21,8 +22,13 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
         'consentCookieName' => 'pwna_consent',
         'rawRetentionDays' => 90,
         'rawEventRetentionDays' => 180,
+        'optimizeAfterPurge' => 1,
+        'lastPurgeAt' => '',
+        'lastOptimizeAt' => '',
         'highTrafficMode' => 0,
         'realtimeWindowMinutes' => 5,
+        'realtimeRefreshSeconds' => 10,
+        'funnelSteps' => '',
         'ignoreQueryString' => 1,
         'excludeRoles' => ['superuser'],
         'excludePaths' => "/processwire/\n/admin/\n/404/",
@@ -46,6 +52,7 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
         'monthlyReportAttachPdf' => 1,
         'monthlyReportIncludeTopPages' => 1,
         'monthlyReportIncludeReferrers' => 1,
+        'monthlyReportIncludeChannels' => 1,
         'monthlyReportIncludeEvents' => 1,
         'monthlyReportLastSentPeriod' => '',
         'trackingMode' => 'js_first',
@@ -61,7 +68,7 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
         return [
             'title' => 'NativeAnalytics',
             'summary' => 'Native first-party analytics dashboard for ProcessWire with traffic, compare, exports, event tracking and goals.',
-            'version' => 1030,
+            'version' => 1031,
             'author' => 'Pyxios - Roych (www.pyxios.com)',
             'href' => 'https://processwire.com/talk/topic/31808-native-analytics-%E2%80%94-a-native-analytics-module-for-processwire/',
             'repo' => 'https://github.com/Roychgod/NativeAnalytics',
@@ -87,6 +94,7 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
 
         if($this->wire('config')->admin) {
             $this->maybeHandleMonthlyReportToolRequest();
+            $this->maybeHandleMaintenanceToolRequest();
         }
 
         if(!$this->trackingEnabled) return;
@@ -434,6 +442,8 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
             `utm_source` VARCHAR(191) NOT NULL DEFAULT '',
             `utm_medium` VARCHAR(191) NOT NULL DEFAULT '',
             `utm_campaign` VARCHAR(191) NOT NULL DEFAULT '',
+            `utm_term` VARCHAR(191) NOT NULL DEFAULT '',
+            `utm_content` VARCHAR(191) NOT NULL DEFAULT '',
             `device_type` VARCHAR(32) NOT NULL DEFAULT '',
             `browser` VARCHAR(64) NOT NULL DEFAULT '',
             `os` VARCHAR(64) NOT NULL DEFAULT '',
@@ -580,6 +590,34 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
             KEY `goal_id` (`goal_id`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
 
+        // First-touch acquisition attribution, one row per session. Populated
+        // via INSERT IGNORE on the first hit of each session so it captures the
+        // channel/campaign that originally brought the visitor. Lets reports
+        // attribute a whole session's pageviews and goal conversions to its
+        // acquisition source, not just the single landing hit.
+        $db->exec("CREATE TABLE IF NOT EXISTS `" . self::ATTRIBUTION_TABLE . "` (
+            `session_hash` CHAR(64) NOT NULL,
+            `visitor_hash` CHAR(64) NOT NULL DEFAULT '',
+            `created_at` DATETIME NOT NULL,
+            `created_date` DATE NOT NULL,
+            `channel` VARCHAR(32) NOT NULL DEFAULT '',
+            `utm_source` VARCHAR(191) NOT NULL DEFAULT '',
+            `utm_medium` VARCHAR(191) NOT NULL DEFAULT '',
+            `utm_campaign` VARCHAR(191) NOT NULL DEFAULT '',
+            `utm_term` VARCHAR(191) NOT NULL DEFAULT '',
+            `utm_content` VARCHAR(191) NOT NULL DEFAULT '',
+            `referrer_host` VARCHAR(191) NOT NULL DEFAULT '',
+            `landing_path` VARCHAR(767) NOT NULL DEFAULT '',
+            `landing_path_hash` CHAR(32) NOT NULL DEFAULT '',
+            `is_bot` TINYINT(1) NOT NULL DEFAULT 0,
+            PRIMARY KEY (`session_hash`),
+            KEY `created_channel` (`created_at`, `channel`),
+            KEY `created_campaign` (`created_at`, `utm_source`, `utm_medium`, `utm_campaign`),
+            KEY `created_date` (`created_date`),
+            KEY `visitor_hash` (`visitor_hash`),
+            KEY `bot_created` (`is_bot`, `created_at`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+
         $this->ensureLegacySchemaColumns();
 
         $this->ensureIndex(self::HITS_TABLE, 'created_status', '`created_at`, `status_code`');
@@ -587,10 +625,19 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
         $this->ensureIndex(self::HITS_TABLE, 'created_template', '`created_at`, `template`');
         $this->ensureIndex(self::HITS_TABLE, 'created_path', '`created_at`, `path_hash`');
         $this->ensureIndex(self::HITS_TABLE, 'created_session', '`created_at`, `session_hash`');
+        // Almost every report and every daily-aggregate rebuild filters
+        // `is_bot = 0` over a `created_at` range. Equality column first, range
+        // second is the optimal order for that access pattern.
+        $this->ensureIndex(self::HITS_TABLE, 'bot_created', '`is_bot`, `created_at`');
+        // Serves the ip_excessive bot rule (GROUP BY ip_hash, created_date,
+        // created_hour) and the IP-based 404/suspicious-path cleanup deletes.
+        // The hits table previously had no ip_hash index at all.
+        $this->ensureIndex(self::HITS_TABLE, 'ip_created', '`ip_hash`, `created_date`, `created_hour`');
         $this->ensureIndex(self::EVENTS_TABLE, 'created_group_name', '`created_at`, `event_group`, `event_name`');
         $this->ensureIndex(self::EVENTS_TABLE, 'created_page', '`created_at`, `page_id`');
         $this->ensureIndex(self::EVENTS_TABLE, 'created_template', '`created_at`, `template`');
         $this->ensureIndex(self::EVENTS_TABLE, 'created_session', '`created_at`, `session_hash`');
+        $this->ensureIndex(self::EVENTS_TABLE, 'bot_created', '`is_bot`, `created_at`');
 
         $done = true;
     }
@@ -617,6 +664,8 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
                 'utm_source' => "`utm_source` VARCHAR(191) NOT NULL DEFAULT '' AFTER `search_term`",
                 'utm_medium' => "`utm_medium` VARCHAR(191) NOT NULL DEFAULT '' AFTER `utm_source`",
                 'utm_campaign' => "`utm_campaign` VARCHAR(191) NOT NULL DEFAULT '' AFTER `utm_medium`",
+                'utm_term' => "`utm_term` VARCHAR(191) NOT NULL DEFAULT '' AFTER `utm_campaign`",
+                'utm_content' => "`utm_content` VARCHAR(191) NOT NULL DEFAULT '' AFTER `utm_term`",
                 'device_type' => "`device_type` VARCHAR(32) NOT NULL DEFAULT '' AFTER `utm_campaign`",
                 'browser' => "`browser` VARCHAR(64) NOT NULL DEFAULT '' AFTER `device_type`",
                 'os' => "`os` VARCHAR(64) NOT NULL DEFAULT '' AFTER `browser`",
@@ -803,8 +852,13 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
             'consentCookieName' => 'pwna_consent',
             'rawRetentionDays' => 90,
             'rawEventRetentionDays' => 180,
+            'optimizeAfterPurge' => 1,
+            'lastPurgeAt' => '',
+            'lastOptimizeAt' => '',
             'highTrafficMode' => 0,
             'realtimeWindowMinutes' => 5,
+            'realtimeRefreshSeconds' => 10,
+            'funnelSteps' => '',
             'ignoreQueryString' => 1,
             'excludeRoles' => ['superuser'],
             'excludePaths' => "/processwire/\n/admin/\n/404/",
@@ -828,6 +882,7 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
             'monthlyReportAttachPdf' => 1,
             'monthlyReportIncludeTopPages' => 1,
             'monthlyReportIncludeReferrers' => 1,
+            'monthlyReportIncludeChannels' => 1,
             'monthlyReportIncludeEvents' => 1,
             'monthlyReportLastSentPeriod' => '',
             'trackingMode' => 'js_first',
@@ -1094,7 +1149,8 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
         $f->label = 'Raw hits retention (days)';
         $f->value = (int) ($data['rawRetentionDays'] ?? 90);
         $f->min = 7;
-        $f->description = 'How long raw hit records are kept before old entries can be purged. Aggregated daily data remains available.';
+        $f->notes = 'Minimum 7 days.';
+        $f->description = 'How long individual page-view rows are kept. Rows older than this are deleted automatically every day so the database stops growing. Aggregated daily stats are kept forever, so historical charts stay intact. Lower this (e.g. 30) if the database file is getting large.';
         $wrapper->add($f);
 
         $f = $wire->modules->get('InputfieldInteger');
@@ -1103,7 +1159,73 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
         $f->label = 'Raw event retention (days)';
         $f->value = (int) ($data['rawEventRetentionDays'] ?? 180);
         $f->min = 7;
-        $f->description = 'How long raw engagement event rows are kept before old entries can be purged. Event and goal aggregates remain available.';
+        $f->notes = 'Minimum 7 days.';
+        $f->description = 'How long individual engagement-event rows are kept before automatic daily cleanup removes them. Event and goal daily aggregates remain available for long-term reporting.';
+        $wrapper->add($f);
+
+        $f = $wire->modules->get('InputfieldCheckbox');
+        $f->name = 'optimizeAfterPurge';
+        $f->showIf = 'trackingEnabled=1';
+        $f->label = 'Reclaim disk space after cleanup';
+        $f->checked = !empty($data['optimizeAfterPurge']);
+        $f->description = 'Recommended. After deleting old rows, rebuild the analytics tables (OPTIMIZE TABLE) so the freed space is returned to the filesystem. Without this, MySQL/InnoDB keeps the space reserved and the database file stays large even after old data is removed. Runs at most once a week during the daily cleanup.';
+        $wrapper->add($f);
+
+        // Live storage status + manual maintenance buttons.
+        $module = $wire->modules->get('NativeAnalytics');
+        if($module instanceof self) {
+            $tokenName = $wire->session->CSRF->getTokenName();
+            $tokenValue = $wire->session->CSRF->getTokenValue();
+            $baseConfigUrl = $wire->config->urls->admin . 'module/edit?name=NativeAnalytics';
+            $purgeUrl = $baseConfigUrl . '&pwna_maintenance_action=purge_now&' . rawurlencode($tokenName) . '=' . rawurlencode($tokenValue);
+            $optimizeUrl = $baseConfigUrl . '&pwna_maintenance_action=optimize_now&' . rawurlencode($tokenName) . '=' . rawurlencode($tokenValue);
+
+            $stats = $module->getStorageStats();
+            $rowsHtml = '';
+            foreach($stats['tables'] as $t) {
+                $rowsHtml .= '<tr><td>' . $wire->sanitizer->entities($t['label'])
+                    . '</td><td style="text-align:right">' . number_format($t['rows'])
+                    . '</td><td style="text-align:right">' . self::formatBytes($t['bytes']) . '</td></tr>';
+            }
+            $rowsHtml .= '<tr style="font-weight:bold;border-top:1px solid rgba(128,128,128,.4)"><td>Total</td><td></td>'
+                . '<td style="text-align:right">' . self::formatBytes($stats['totalBytes']) . '</td></tr>';
+
+            $lastPurge = trim((string) ($data['lastPurgeAt'] ?? '')) ?: 'never';
+            $lastOptimize = trim((string) ($data['lastOptimizeAt'] ?? '')) ?: 'never';
+
+            $f = $wire->modules->get('InputfieldMarkup');
+            $f->name = 'retentionStatus';
+            $f->showIf = 'trackingEnabled=1';
+            $f->label = 'Storage status & manual maintenance';
+            $f->value =
+                '<table class="pwna-storage-table" style="width:auto;min-width:340px;border-collapse:collapse;margin-bottom:.5em">'
+                . '<thead><tr><th style="text-align:left">Table</th><th style="text-align:right">Rows</th><th style="text-align:right">Size</th></tr></thead>'
+                . '<tbody>' . $rowsHtml . '</tbody></table>'
+                . '<p class="description">Automatic cleanup runs daily via LazyCron. Last cleanup: <strong>' . $wire->sanitizer->entities($lastPurge)
+                . '</strong> &middot; Last disk reclaim: <strong>' . $wire->sanitizer->entities($lastOptimize) . '</strong>.</p>'
+                . '<p class="pwna-maintenance-buttons">'
+                . '<a class="ui-button ui-priority-secondary" href="' . $wire->sanitizer->entities($purgeUrl) . '"><i class="fa fa-trash-o"></i> Purge old data now</a> '
+                . '<a class="ui-button ui-priority-secondary" href="' . $wire->sanitizer->entities($optimizeUrl) . '"><i class="fa fa-compress"></i> Reclaim disk space now</a>'
+                . '</p>'
+                . '<p class="description">Save any changed retention values first. "Purge old data now" applies the retention limits above immediately; "Reclaim disk space now" rebuilds the tables so freed space returns to the filesystem.</p>';
+            $wrapper->add($f);
+        }
+
+        $f = $wire->modules->get('InputfieldHidden');
+        $f->name = 'lastPurgeAt';
+        $f->value = $data['lastPurgeAt'] ?? '';
+        $wrapper->add($f);
+
+        $f = $wire->modules->get('InputfieldHidden');
+        $f->name = 'lastOptimizeAt';
+        $f->value = $data['lastOptimizeAt'] ?? '';
+        $wrapper->add($f);
+
+        // The funnel definition is edited on the dashboard Funnel tab, not here.
+        // A hidden field keeps it from being wiped when module settings are saved.
+        $f = $wire->modules->get('InputfieldHidden');
+        $f->name = 'funnelSteps';
+        $f->value = $data['funnelSteps'] ?? '';
         $wrapper->add($f);
 
         $f = $wire->modules->get('InputfieldCheckbox');
@@ -1122,6 +1244,17 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
         $f->min = 1;
         $f->max = 60;
         $f->description = 'How many recent minutes should count as an active current visitor in the dashboard.';
+        $wrapper->add($f);
+
+        $f = $wire->modules->get('InputfieldInteger');
+        $f->name = 'realtimeRefreshSeconds';
+        $f->showIf = 'trackingEnabled=1';
+        $f->label = 'Dashboard auto-refresh (seconds)';
+        $f->value = (int) ($data['realtimeRefreshSeconds'] ?? 10);
+        $f->min = 0;
+        $f->max = 300;
+        $f->notes = 'Set to 0 to disable auto-refresh. Minimum 5 seconds when enabled.';
+        $f->description = 'How often the open dashboard refreshes live figures (cards, chart, current visitors). Polling automatically pauses while the browser tab is hidden and resumes when you return, to avoid needless server load.';
         $wrapper->add($f);
 
         $f = $wire->modules->get('InputfieldCheckbox');
@@ -1253,6 +1386,14 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
         $f->showIf = 'trackingEnabled=1, monthlyReportsEnabled=1';
         $f->label = 'Include top referrers in monthly report';
         $f->checked = !empty($data['monthlyReportIncludeReferrers']);
+        $wrapper->add($f);
+
+        $f = $wire->modules->get('InputfieldCheckbox');
+        $f->name = 'monthlyReportIncludeChannels';
+        $f->showIf = 'trackingEnabled=1, monthlyReportsEnabled=1';
+        $f->label = 'Include acquisition channels in monthly report';
+        $f->checked = !empty($data['monthlyReportIncludeChannels']);
+        $f->description = 'Adds a first-touch channel breakdown (Direct, Organic Search, Social, Referral, Paid, Email, Campaign) by sessions.';
         $wrapper->add($f);
 
         $f = $wire->modules->get('InputfieldCheckbox');
@@ -1466,8 +1607,11 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
                 [
                     ['rawRetentionDays', 50],
                     ['rawEventRetentionDays', 50],
+                    ['optimizeAfterPurge', 100],
+                    ['retentionStatus', 100],
                     ['highTrafficMode', 50],
                     ['realtimeWindowMinutes', 50],
+                    ['realtimeRefreshSeconds', 50],
                     ['ignoreQueryString', 100],
                 ],
             ],
@@ -1505,6 +1649,7 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
                     ['monthlyReportIncludeTopPages', 33],
                     ['monthlyReportIncludeReferrers', 33],
                     ['monthlyReportIncludeEvents', 34],
+                    ['monthlyReportIncludeChannels', 100],
                     ['monthlyReportTestTool', 100],
                     ['monthlyReportPreview', 100],
                     ['monthlyReportLastSentPeriod', 100],
@@ -2037,6 +2182,8 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
             'utm_source' => $this->trimValue((string) ($queryVars['utm_source'] ?? ''), 191),
             'utm_medium' => $this->trimValue((string) ($queryVars['utm_medium'] ?? ''), 191),
             'utm_campaign' => $this->trimValue((string) ($queryVars['utm_campaign'] ?? ''), 191),
+            'utm_term' => $this->trimValue((string) ($queryVars['utm_term'] ?? ''), 191),
+            'utm_content' => $this->trimValue((string) ($queryVars['utm_content'] ?? ''), 191),
             'device_type' => $this->trimValue($device['device_type'], 32),
             'browser' => $this->trimValue($device['browser'], 64),
             'os' => $this->trimValue($device['os'], 64),
@@ -2050,6 +2197,7 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
 
         try {
             $this->insert(self::HITS_TABLE, $row);
+            $this->recordSessionAttribution($row);
             $this->upsertRealtimeSession($row);
         } catch(\Throwable $e) {
             $this->wire('log')->save('native-analytics', 'Server-side tracking failed: ' . $e->getMessage());
@@ -2520,6 +2668,8 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
             'utm_source' => $this->trimValue((string) ($queryVars['utm_source'] ?? ''), 191),
             'utm_medium' => $this->trimValue((string) ($queryVars['utm_medium'] ?? ''), 191),
             'utm_campaign' => $this->trimValue((string) ($queryVars['utm_campaign'] ?? ''), 191),
+            'utm_term' => $this->trimValue((string) ($queryVars['utm_term'] ?? ''), 191),
+            'utm_content' => $this->trimValue((string) ($queryVars['utm_content'] ?? ''), 191),
             'device_type' => $this->trimValue($device['device_type'], 32),
             'browser' => $this->trimValue($device['browser'], 64),
             'os' => $this->trimValue($device['os'], 64),
@@ -2533,6 +2683,7 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
 
         try {
             $this->insert(self::HITS_TABLE, $row);
+            $this->recordSessionAttribution($row);
         } catch(\Throwable $e) {
             $this->wire('log')->save('native-analytics', 'Raw hit insert failed: ' . $e->getMessage());
         }
@@ -2726,8 +2877,20 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
         $this->rebuildDailyAggregate($day);
         $this->rebuildEventDailyAggregate($day);
         $this->rebuildGoalDailyAggregate($day);
-        $this->purgeOldHits();
-        $this->purgeOldEvents();
+        $deleted = $this->purgeOldHits() + $this->purgeOldEvents();
+        $this->purgeOldAttribution();
+        $this->saveConfigValue('lastPurgeAt', date('Y-m-d H:i:s'));
+
+        // InnoDB does not return freed disk space to the OS after DELETE, so the
+        // database file keeps growing even though old rows are gone. When enabled,
+        // rebuild the raw tables (at most weekly) to actually reclaim that space.
+        if(!empty($this->optimizeAfterPurge) && $deleted > 0) {
+            $lastOptimize = strtotime((string) $this->lastOptimizeAt);
+            if(!$lastOptimize || $lastOptimize < strtotime('-7 days')) {
+                $this->optimizeTables();
+            }
+        }
+
         $this->maybeSendMonthlyReport();
     }
 
@@ -2944,6 +3107,7 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
         $cutoff = date('Y-m-d H:i:s', strtotime('-' . max(7, (int) $this->rawRetentionDays) . ' days'));
         $stmt = $this->wire('database')->prepare("DELETE FROM `" . self::HITS_TABLE . "` WHERE `created_at` < :cutoff");
         $stmt->execute([':cutoff' => $cutoff]);
+        return (int) $stmt->rowCount();
     }
 
 
@@ -2951,6 +3115,147 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
         $cutoff = date('Y-m-d H:i:s', strtotime('-' . max(7, (int) $this->rawEventRetentionDays) . ' days'));
         $stmt = $this->wire('database')->prepare("DELETE FROM `" . self::EVENTS_TABLE . "` WHERE `created_at` < :cutoff");
         $stmt->execute([':cutoff' => $cutoff]);
+        return (int) $stmt->rowCount();
+    }
+
+    /**
+     * Run retention purge immediately (hits + events + stale realtime sessions)
+     * and record the time. Returns the number of raw rows deleted.
+     */
+    public function runManualPurge() {
+        $deleted = $this->purgeOldHits() + $this->purgeOldEvents();
+        $this->purgeOldAttribution();
+        $this->purgeOldRealtimeSessions();
+        $this->saveConfigValue('lastPurgeAt', date('Y-m-d H:i:s'));
+        return $deleted;
+    }
+
+    /**
+     * Attribution follows the raw-hits retention window: once the hits that
+     * created a session are gone, its attribution row is no longer needed.
+     */
+    public function purgeOldAttribution() {
+        $cutoff = date('Y-m-d H:i:s', strtotime('-' . max(7, (int) $this->rawRetentionDays) . ' days'));
+        $stmt = $this->wire('database')->prepare("DELETE FROM `" . self::ATTRIBUTION_TABLE . "` WHERE `created_at` < :cutoff");
+        $stmt->execute([':cutoff' => $cutoff]);
+        return (int) $stmt->rowCount();
+    }
+
+    /**
+     * Rebuild the analytics tables to return freed space to the filesystem.
+     *
+     * InnoDB keeps deleted-row space inside its tablespace, so the DB file does
+     * not shrink after purging. OPTIMIZE TABLE performs an online rebuild that
+     * compacts the table and reclaims that space. Safe to run on all pwna_*
+     * tables; the raw hits/events tables are where the growth actually lives.
+     */
+    public function optimizeTables() {
+        $db = $this->wire('database');
+        $tables = [
+            self::HITS_TABLE, self::EVENTS_TABLE, self::SESSIONS_TABLE,
+            self::ATTRIBUTION_TABLE,
+            self::DAILY_TABLE, self::EVENT_DAILY_TABLE, self::GOAL_DAILY_TABLE,
+        ];
+        foreach($tables as $table) {
+            try {
+                // OPTIMIZE TABLE returns a result set (Table, Op, Msg_type,
+                // Msg_text). It must be fully consumed and the cursor closed,
+                // otherwise the next query fails with SQLSTATE HY000 2014
+                // "Cannot execute queries while other unbuffered queries are active".
+                $stmt = $db->query("OPTIMIZE TABLE `" . $table . "`");
+                if($stmt instanceof \PDOStatement) {
+                    $stmt->fetchAll();
+                    $stmt->closeCursor();
+                }
+            } catch(\Throwable $e) {
+                $this->wire('log')->save('native-analytics', 'OPTIMIZE TABLE failed for ' . $table . ': ' . $e->getMessage());
+            }
+        }
+        $this->saveConfigValue('lastOptimizeAt', date('Y-m-d H:i:s'));
+        return true;
+    }
+
+    /**
+     * Per-table row counts and on-disk size (data + index) for the pwna_*
+     * tables, read from information_schema. Used by the config status panel.
+     */
+    public function getStorageStats() {
+        $db = $this->wire('database');
+        $tables = [
+            self::HITS_TABLE       => 'Raw hits',
+            self::EVENTS_TABLE     => 'Raw events',
+            self::SESSIONS_TABLE   => 'Realtime sessions',
+            self::ATTRIBUTION_TABLE => 'Attribution',
+            self::DAILY_TABLE      => 'Daily aggregates',
+            self::EVENT_DAILY_TABLE => 'Event aggregates',
+            self::GOAL_DAILY_TABLE => 'Goal aggregates',
+        ];
+        $stats = [];
+        $totalBytes = 0;
+        try {
+            $stmt = $db->prepare(
+                "SELECT TABLE_NAME, TABLE_ROWS, (DATA_LENGTH + INDEX_LENGTH) AS SIZE_BYTES
+                 FROM information_schema.TABLES
+                 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN (" . implode(',', array_fill(0, count($tables), '?')) . ")"
+            );
+            $stmt->execute(array_keys($tables));
+            $rows = $stmt->fetchAll(\PDO::FETCH_ASSOC);
+            $byName = [];
+            foreach($rows as $r) $byName[$r['TABLE_NAME']] = $r;
+            foreach($tables as $name => $label) {
+                $bytes = isset($byName[$name]) ? (int) $byName[$name]['SIZE_BYTES'] : 0;
+                // TABLE_ROWS is an estimate for InnoDB; get the exact count for
+                // the raw tables where accuracy matters most.
+                $count = 0;
+                try {
+                    $c = $db->query("SELECT COUNT(*) FROM `" . $name . "`");
+                    $count = (int) $c->fetchColumn();
+                    $c->closeCursor();
+                } catch(\Throwable $e) {
+                    $count = isset($byName[$name]) ? (int) $byName[$name]['TABLE_ROWS'] : 0;
+                }
+                $stats[] = ['label' => $label, 'table' => $name, 'rows' => $count, 'bytes' => $bytes];
+                $totalBytes += $bytes;
+            }
+        } catch(\Throwable $e) {
+            $this->wire('log')->save('native-analytics', 'getStorageStats failed: ' . $e->getMessage());
+        }
+        return ['tables' => $stats, 'totalBytes' => $totalBytes];
+    }
+
+    public static function formatBytes($bytes) {
+        $bytes = max(0, (int) $bytes);
+        $units = ['B', 'KB', 'MB', 'GB', 'TB'];
+        $i = 0;
+        while($bytes >= 1024 && $i < count($units) - 1) { $bytes /= 1024; $i++; }
+        return round($bytes, $i ? 1 : 0) . ' ' . $units[$i];
+    }
+
+    /**
+     * Persist a single module config value without disturbing the rest.
+     */
+    /**
+     * Persist the current funnel definition (raw multi-line text) so the
+     * dashboard funnel survives reloads. Trimmed and length-capped.
+     */
+    public function saveFunnelSteps($raw) {
+        $raw = trim((string) $raw);
+        if(strlen($raw) > 4000) $raw = substr($raw, 0, 4000);
+        $this->saveConfigValue('funnelSteps', $raw);
+        return $raw;
+    }
+
+    protected function saveConfigValue($key, $value) {
+        $this->set($key, $value);
+        try {
+            $this->wire('modules')->saveConfig($this, [$key => $value]);
+        } catch(\Throwable $e) {
+            try {
+                $this->wire('modules')->saveConfig('NativeAnalytics', [$key => $value]);
+            } catch(\Throwable $e2) {
+                $this->wire('log')->save('native-analytics', 'Could not save config value ' . $key . ': ' . $e2->getMessage());
+            }
+        }
     }
 
     public function purgeOldRealtimeSessions($hours = 48) {
@@ -2965,6 +3270,7 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
         $db->exec("DELETE FROM `" . self::EVENT_DAILY_TABLE . "`");
         $db->exec("DELETE FROM `" . self::EVENTS_TABLE . "`");
         $db->exec("DELETE FROM `" . self::SESSIONS_TABLE . "`");
+        $db->exec("DELETE FROM `" . self::ATTRIBUTION_TABLE . "`");
         $db->exec("DELETE FROM `" . self::DAILY_TABLE . "`");
         $db->exec("DELETE FROM `" . self::HITS_TABLE . "`");
     }
@@ -3149,18 +3455,20 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
     }
 
     public function getTopCampaigns($days = 30, $limit = 10, array $filters = []) {
-        $where = $this->buildWhere($filters, $this->getDateRangeForDays($days), ["(utm_source != '' OR utm_medium != '' OR utm_campaign != '')"]);
+        $where = $this->buildWhere($filters, $this->getDateRangeForDays($days), ["(utm_source != '' OR utm_medium != '' OR utm_campaign != '' OR utm_content != '')"]);
         $sql = "SELECT CONCAT_WS(' / ',
                     NULLIF(utm_source, ''),
                     NULLIF(utm_medium, ''),
-                    NULLIF(utm_campaign, '')
+                    NULLIF(utm_campaign, ''),
+                    NULLIF(utm_content, '')
                 ) AS label,
+                utm_source, utm_medium, utm_campaign, utm_content,
                 COUNT(*) AS views,
                 COUNT(DISTINCT visitor_hash) AS uniques,
                 COUNT(DISTINCT session_hash) AS sessions
                 FROM `" . self::HITS_TABLE . "`
                 WHERE {$where['sql']}
-                GROUP BY utm_source, utm_medium, utm_campaign
+                GROUP BY utm_source, utm_medium, utm_campaign, utm_content
                 ORDER BY views DESC, uniques DESC
                 LIMIT " . (int) $limit;
         $stmt = $this->wire('database')->prepare($sql);
@@ -3168,6 +3476,273 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
         return $stmt->fetchAll(\PDO::FETCH_ASSOC) ?: [];
     }
 
+    /**
+     * First-touch channel breakdown (Direct / Organic Search / Social /
+     * Referral / Paid / Email / Campaign …), one row per acquired session.
+     * Reads the session-level attribution table, so counts reflect whole
+     * sessions rather than only landing hits.
+     */
+    public function getTopChannels($days = 30, $limit = 12, array $filters = []) {
+        $range = $this->getDateRangeForDays($days);
+        $params = [':start' => $range['start'], ':end' => $range['end']];
+        $botClause = empty($filters['include_bots']) ? ' AND is_bot = 0' : '';
+        $sql = "SELECT channel AS label,
+                    COUNT(*) AS sessions,
+                    COUNT(DISTINCT visitor_hash) AS uniques
+                FROM `" . self::ATTRIBUTION_TABLE . "`
+                WHERE created_at >= :start AND created_at <= :end" . $botClause . "
+                GROUP BY channel
+                ORDER BY sessions DESC, uniques DESC
+                LIMIT " . (int) $limit;
+        try {
+            $stmt = $this->wire('database')->prepare($sql);
+            $stmt->execute($params);
+            return $stmt->fetchAll(\PDO::FETCH_ASSOC) ?: [];
+        } catch(\Throwable $e) {
+            $this->wire('log')->save('native-analytics', 'getTopChannels failed: ' . $e->getMessage());
+            return [];
+        }
+    }
+
+    /**
+     * Session-level campaign breakdown from first-touch attribution.
+     * Unlike getTopCampaigns() (per-hit), this counts each acquired session
+     * once against the campaign that brought it.
+     */
+    public function getAttributedCampaigns($days = 30, $limit = 10, array $filters = []) {
+        $range = $this->getDateRangeForDays($days);
+        $params = [':start' => $range['start'], ':end' => $range['end']];
+        $botClause = empty($filters['include_bots']) ? ' AND is_bot = 0' : '';
+        $sql = "SELECT CONCAT_WS(' / ',
+                    NULLIF(utm_source, ''),
+                    NULLIF(utm_medium, ''),
+                    NULLIF(utm_campaign, ''),
+                    NULLIF(utm_content, '')
+                ) AS label,
+                COUNT(*) AS sessions,
+                COUNT(DISTINCT visitor_hash) AS uniques
+                FROM `" . self::ATTRIBUTION_TABLE . "`
+                WHERE created_at >= :start AND created_at <= :end" . $botClause . "
+                  AND (utm_source != '' OR utm_medium != '' OR utm_campaign != '' OR utm_content != '')
+                GROUP BY utm_source, utm_medium, utm_campaign, utm_content
+                ORDER BY sessions DESC, uniques DESC
+                LIMIT " . (int) $limit;
+        try {
+            $stmt = $this->wire('database')->prepare($sql);
+            $stmt->execute($params);
+            return $stmt->fetchAll(\PDO::FETCH_ASSOC) ?: [];
+        } catch(\Throwable $e) {
+            $this->wire('log')->save('native-analytics', 'getAttributedCampaigns failed: ' . $e->getMessage());
+            return [];
+        }
+    }
+
+    /**
+     * Parse a raw multi-line funnel definition into ordered steps.
+     * Each non-empty line is one step. Syntax per line:
+     *   /path/here            page step, exact path match
+     *   /section/*            page step, prefix match
+     *   event:group           event step, any event in that group
+     *   event:group/name      event step, group + name
+     *   event:group/name/label event step, group + name + label
+     *   Label = <spec>        optional display label before '='
+     * Capped at 8 steps.
+     *
+     * @return array List of step descriptors. Page steps:
+     *   ['label','type'=>'path','match','prefix'].
+     * Event steps:
+     *   ['label','type'=>'event','group','name','event_label'].
+     */
+    public function parseFunnelSteps($raw) {
+        $steps = [];
+        foreach(preg_split('/\r\n|\r|\n/', (string) $raw) as $line) {
+            $line = trim($line);
+            if($line === '') continue;
+            $label = '';
+            if(strpos($line, '=') !== false) {
+                list($label, $line) = array_map('trim', explode('=', $line, 2));
+            }
+            if($line === '') continue;
+
+            if(stripos($line, 'event:') === 0) {
+                $spec = trim(substr($line, 6));
+                if($spec === '') continue;
+                $parts = array_map('trim', explode('/', $spec, 3));
+                $group = $parts[0] ?? '';
+                if($group === '') continue;
+                $name = $parts[1] ?? '';
+                $eventLabel = $parts[2] ?? '';
+                $auto = 'event: ' . $group . ($name !== '' ? ' / ' . $name : '') . ($eventLabel !== '' ? ' / ' . $eventLabel : '');
+                $steps[] = [
+                    'label' => $label !== '' ? $label : $auto,
+                    'type' => 'event',
+                    'group' => $group,
+                    'name' => $name,
+                    'event_label' => $eventLabel,
+                ];
+            } else {
+                $prefix = false;
+                if(substr($line, -1) === '*') {
+                    $prefix = true;
+                    $line = rtrim($line, '*');
+                    if($line === '') continue;
+                }
+                $steps[] = [
+                    'label' => $label !== '' ? $label : ($prefix ? $line . '*' : $line),
+                    'type' => 'path',
+                    'match' => $line,
+                    'prefix' => $prefix,
+                ];
+            }
+            if(count($steps) >= 8) break;
+        }
+        return $steps;
+    }
+
+    /**
+     * Compute a sequential funnel that can mix page (path) and event steps.
+     *
+     * Semantics: a session counts for step k if it reached step k at or after
+     * the time it first reached step k-1 (using each step's first-occurrence
+     * time). Sessions that skip a step drop out from there on. Only sessions
+     * that entered step 1 are considered.
+     *
+     * Page steps are matched against pwna_hits, event steps against
+     * pwna_events; first-touch times from both are merged per session before
+     * the sequential walk, so the two kinds can interleave freely.
+     *
+     * @return array ['steps' => [['label','type','sessions','conv_from_start','conv_from_prev','dropoff'], ...], 'entered' => int]
+     */
+    public function getFunnelReport(array $steps, $days = 30, array $filters = []) {
+        $steps = array_slice(array_values($steps), 0, 8);
+        $n = count($steps);
+        if($n < 2) return ['steps' => [], 'entered' => 0];
+
+        $range = $this->getDateRangeForDays($days);
+        $botClause = empty($filters['include_bots']) ? ' AND is_bot = 0' : '';
+
+        // Merged per-session first-touch times, indexed by step position.
+        $times = [];
+        $ensure = function($sh) use (&$times, $n) {
+            if(!isset($times[$sh])) $times[$sh] = array_fill(0, $n, null);
+        };
+
+        // --- Page steps → pwna_hits ---
+        $pathSelects = [];
+        $pathOr = [];
+        $pathParams = [':start' => $range['start'], ':end' => $range['end']];
+        foreach($steps as $i => $step) {
+            if(($step['type'] ?? 'path') !== 'path') continue;
+            $key = ':fp' . $i;
+            if(!empty($step['prefix'])) {
+                $cond = "path LIKE {$key}";
+                $pathParams[$key] = pwna_escape_like_term((string) $step['match']) . '%';
+            } else {
+                $cond = "path = {$key}";
+                $pathParams[$key] = (string) $step['match'];
+            }
+            $pathSelects[] = "MIN(CASE WHEN {$cond} THEN created_at END) AS t{$i}";
+            $pathOr[] = $cond;
+        }
+        if($pathSelects) {
+            $sql = "SELECT session_hash, " . implode(', ', $pathSelects) . "
+                    FROM `" . self::HITS_TABLE . "`
+                    WHERE created_at >= :start AND created_at <= :end" . $botClause . "
+                      AND (" . implode(' OR ', $pathOr) . ")
+                    GROUP BY session_hash";
+            try {
+                $stmt = $this->wire('database')->prepare($sql);
+                $stmt->execute($pathParams);
+                while($row = $stmt->fetch(\PDO::FETCH_ASSOC)) {
+                    $sh = $row['session_hash'];
+                    $ensure($sh);
+                    foreach($steps as $i => $step) {
+                        if(($step['type'] ?? 'path') !== 'path') continue;
+                        if($row['t' . $i] !== null) $times[$sh][$i] = $row['t' . $i];
+                    }
+                }
+            } catch(\Throwable $e) {
+                $this->wire('log')->save('native-analytics', 'getFunnelReport (path) failed: ' . $e->getMessage());
+                return ['steps' => [], 'entered' => 0];
+            }
+        }
+
+        // --- Event steps → pwna_events ---
+        $eventSelects = [];
+        $eventOr = [];
+        $eventParams = [':start' => $range['start'], ':end' => $range['end']];
+        foreach($steps as $i => $step) {
+            if(($step['type'] ?? 'path') !== 'event') continue;
+            $conds = ["event_group = :eg{$i}"];
+            $eventParams[":eg{$i}"] = (string) $step['group'];
+            if(($step['name'] ?? '') !== '') {
+                $conds[] = "event_name = :en{$i}";
+                $eventParams[":en{$i}"] = (string) $step['name'];
+            }
+            if(($step['event_label'] ?? '') !== '') {
+                $conds[] = "event_label = :el{$i}";
+                $eventParams[":el{$i}"] = (string) $step['event_label'];
+            }
+            $cond = '(' . implode(' AND ', $conds) . ')';
+            $eventSelects[] = "MIN(CASE WHEN {$cond} THEN created_at END) AS t{$i}";
+            $eventOr[] = $cond;
+        }
+        if($eventSelects) {
+            $sql = "SELECT session_hash, " . implode(', ', $eventSelects) . "
+                    FROM `" . self::EVENTS_TABLE . "`
+                    WHERE created_at >= :start AND created_at <= :end" . $botClause . "
+                      AND (" . implode(' OR ', $eventOr) . ")
+                    GROUP BY session_hash";
+            try {
+                $stmt = $this->wire('database')->prepare($sql);
+                $stmt->execute($eventParams);
+                while($row = $stmt->fetch(\PDO::FETCH_ASSOC)) {
+                    $sh = $row['session_hash'];
+                    $ensure($sh);
+                    foreach($steps as $i => $step) {
+                        if(($step['type'] ?? 'path') !== 'event') continue;
+                        if($row['t' . $i] !== null) $times[$sh][$i] = $row['t' . $i];
+                    }
+                }
+            } catch(\Throwable $e) {
+                $this->wire('log')->save('native-analytics', 'getFunnelReport (event) failed: ' . $e->getMessage());
+                return ['steps' => [], 'entered' => 0];
+            }
+        }
+
+        // --- Sequential walk per session ---
+        $counts = array_fill(0, $n, 0);
+        foreach($times as $row) {
+            if($row[0] === null) continue; // never entered step 1
+            $prev = $row[0];
+            $counts[0]++;
+            for($k = 1; $k < $n; $k++) {
+                $tk = $row[$k];
+                if($tk !== null && $tk >= $prev) {
+                    $counts[$k]++;
+                    $prev = $tk;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        $entered = $counts[0];
+        $out = [];
+        foreach($steps as $i => $step) {
+            $sessions = $counts[$i];
+            $prevSessions = $i > 0 ? $counts[$i - 1] : $sessions;
+            $out[] = [
+                'label' => (string) $step['label'],
+                'type' => (string) ($step['type'] ?? 'path'),
+                'sessions' => $sessions,
+                'conv_from_start' => $entered > 0 ? round($sessions / $entered * 100, 1) : 0.0,
+                'conv_from_prev' => $prevSessions > 0 ? round($sessions / $prevSessions * 100, 1) : 0.0,
+                'dropoff' => $prevSessions > 0 ? max(0, $prevSessions - $sessions) : 0,
+            ];
+        }
+        return ['steps' => $out, 'entered' => $entered];
+    }
 
     public function getTopPages($days = 30, $limit = 15, array $filters = []) {
         $where = $this->buildWhere($filters, $this->getDateRangeForDays($days), ["status_code != 404"]);
@@ -3759,6 +4334,93 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
         $stmt->execute(array_combine($placeholders, array_values($row)));
     }
 
+    /**
+     * Record first-touch acquisition attribution for a session.
+     *
+     * Called once per hit; INSERT IGNORE on the session_hash primary key means
+     * only the FIRST hit of a session persists, capturing the channel/campaign
+     * that originally brought the visitor. Later pageviews in the same session
+     * (which usually carry no UTM params) do not overwrite it, so reports can
+     * attribute the whole session to its true acquisition source.
+     *
+     * @param array $row A hit row as built by the tracking paths.
+     */
+    protected function recordSessionAttribution(array $row) {
+        $sessionHash = (string) ($row['session_hash'] ?? '');
+        if($sessionHash === '') return;
+
+        $channel = $this->classifyChannel(
+            (string) ($row['utm_medium'] ?? ''),
+            (string) ($row['utm_source'] ?? ''),
+            (string) ($row['referrer_host'] ?? '')
+        );
+
+        $data = [
+            'session_hash' => $sessionHash,
+            'visitor_hash' => (string) ($row['visitor_hash'] ?? ''),
+            'created_at' => (string) ($row['created_at'] ?? date('Y-m-d H:i:s')),
+            'created_date' => (string) ($row['created_date'] ?? date('Y-m-d')),
+            'channel' => $channel,
+            'utm_source' => (string) ($row['utm_source'] ?? ''),
+            'utm_medium' => (string) ($row['utm_medium'] ?? ''),
+            'utm_campaign' => (string) ($row['utm_campaign'] ?? ''),
+            'utm_term' => (string) ($row['utm_term'] ?? ''),
+            'utm_content' => (string) ($row['utm_content'] ?? ''),
+            'referrer_host' => (string) ($row['referrer_host'] ?? ''),
+            'landing_path' => $this->trimValue((string) ($row['path'] ?? ''), 767),
+            'landing_path_hash' => (string) ($row['path_hash'] ?? ''),
+            'is_bot' => (int) ($row['is_bot'] ?? 0),
+        ];
+
+        try {
+            $db = $this->wire('database');
+            $columns = array_keys($data);
+            $placeholders = array_map(function($c) { return ':' . $c; }, $columns);
+            $sql = "INSERT IGNORE INTO `" . self::ATTRIBUTION_TABLE . "` (`"
+                . implode('`,`', $columns) . "`) VALUES (" . implode(',', $placeholders) . ")";
+            $stmt = $db->prepare($sql);
+            $stmt->execute(array_combine($placeholders, array_values($data)));
+        } catch(\Throwable $e) {
+            $this->wire('log')->save('native-analytics', 'Attribution insert failed: ' . $e->getMessage());
+        }
+    }
+
+    /**
+     * Classify a hit into a marketing channel, first-touch style.
+     *
+     * Precedence: explicit UTM medium/source, then referrer host, else Direct.
+     * Deliberately conservative and dependency-free (no external lists).
+     */
+    public function classifyChannel($utmMedium, $utmSource, $referrerHost) {
+        $medium = strtolower(trim((string) $utmMedium));
+        $source = strtolower(trim((string) $utmSource));
+        $host = strtolower(trim((string) $referrerHost));
+
+        if($medium !== '') {
+            if(in_array($medium, ['cpc', 'ppc', 'paid', 'paidsearch', 'paid-search', 'paid_search', 'cpm', 'cpv', 'banner', 'display', 'retargeting'], true)) return 'Paid';
+            if(in_array($medium, ['email', 'e-mail', 'newsletter', 'mail'], true)) return 'Email';
+            if(in_array($medium, ['social', 'social-network', 'social_network', 'social-media', 'social_media', 'sm', 'social network'], true)) return 'Social';
+            if($medium === 'affiliate') return 'Affiliate';
+            if($medium === 'organic') return 'Organic Search';
+            if($medium === 'referral') return 'Referral';
+            return 'Campaign';
+        }
+
+        if($host !== '') {
+            $searchEngines = ['google.', 'bing.', 'duckduckgo.', 'yahoo.', 'yandex.', 'baidu.', 'ecosia.', 'brave.', 'startpage.', 'qwant.', 'ask.'];
+            foreach($searchEngines as $needle) {
+                if(strpos($host, $needle) !== false) return 'Organic Search';
+            }
+            $social = ['facebook.', 'fb.', 'instagram.', 'l.instagram.', 't.co', 'twitter.', 'x.com', 'linkedin.', 'lnkd.in', 'youtube.', 'youtu.be', 'reddit.', 'pinterest.', 'tiktok.', 'mastodon.', 'threads.', 'whatsapp.', 'telegram.', 't.me'];
+            foreach($social as $needle) {
+                if(strpos($host, $needle) !== false) return 'Social';
+            }
+            return 'Referral';
+        }
+
+        return 'Direct';
+    }
+
 
     public function getGoals($includeInactive = false) {
         $sql = "SELECT * FROM `" . self::GOALS_TABLE . "`" . ($includeInactive ? '' : ' WHERE `active` = 1') . " ORDER BY `active` DESC, `title` ASC, `id` ASC";
@@ -4329,6 +4991,49 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
         $session->redirect($redirectUrl);
     }
 
+    protected function maybeHandleMaintenanceToolRequest() {
+        if(!$this->wire('config')->admin) return;
+
+        $input = $this->wire('input');
+        $action = (string) $input->get('pwna_maintenance_action');
+        if($action !== 'purge_now' && $action !== 'optimize_now') return;
+
+        $session = $this->wire('session');
+        $user = $this->wire('user');
+        $redirectUrl = $this->getModuleConfigUrl();
+
+        if(!$user->isSuperuser() && !$user->hasPermission('nativeanalytics-manage')) {
+            $session->error('NativeAnalytics: You do not have permission to run maintenance.');
+            $session->redirect($redirectUrl);
+        }
+
+        $tokenName = $session->CSRF->getTokenName();
+        $expectedTokenValue = (string) $session->CSRF->getTokenValue();
+        $requestTokenValue = (string) $input->get($tokenName);
+        if($requestTokenValue === '' || !hash_equals($expectedTokenValue, $requestTokenValue)) {
+            $session->error('NativeAnalytics: Security token expired. Please try again.');
+            $session->redirect($redirectUrl);
+        }
+
+        try {
+            if($action === 'purge_now') {
+                $deleted = $this->runManualPurge();
+                $msg = 'NativeAnalytics: Cleanup complete. Removed ' . number_format($deleted) . ' old raw rows.';
+                if(!empty($this->optimizeAfterPurge) && $deleted > 0) {
+                    $this->optimizeTables();
+                    $msg .= ' Tables rebuilt to reclaim disk space.';
+                }
+                $session->message($msg);
+            } else {
+                $this->optimizeTables();
+                $session->message('NativeAnalytics: Tables rebuilt. Freed space returned to the filesystem.');
+            }
+        } catch(\Throwable $e) {
+            $session->error('NativeAnalytics: Maintenance failed: ' . $e->getMessage());
+        }
+        $session->redirect($redirectUrl);
+    }
+
     protected function getModuleConfigUrl() {
         return $this->wire('config')->urls->admin . 'module/edit?name=NativeAnalytics';
     }
@@ -4651,6 +5356,19 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
             }
             $elements[] = ['type' => 'section', 'title' => 'Top referrers'];
             $elements[] = ['type' => 'table', 'headers' => ['Referrer', 'Views'], 'widths' => [0.78, 0.22], 'rows' => $rows, 'empty' => 'No referrer data for this period.'];
+        }
+
+        if(!empty($this->monthlyReportIncludeChannels)) {
+            $rows = [];
+            foreach($this->getTopChannels($range, 8, []) as $row) {
+                $rows[] = [
+                    (string) ($row['label'] ?? ''),
+                    (string) (int) ($row['sessions'] ?? 0),
+                    (string) (int) ($row['uniques'] ?? 0),
+                ];
+            }
+            $elements[] = ['type' => 'section', 'title' => 'Channels (first-touch sessions)'];
+            $elements[] = ['type' => 'table', 'headers' => ['Channel', 'Sessions', 'Unique visitors'], 'widths' => [0.58, 0.21, 0.21], 'rows' => $rows, 'empty' => 'No acquisition data for this period.'];
         }
 
         if(!empty($this->monthlyReportIncludeEvents)) {
@@ -4997,6 +5715,17 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
             });
         }
 
+        if(!empty($this->monthlyReportIncludeChannels)) {
+            $channels = $this->getTopChannels($range, 8, []);
+            $html .= $this->renderMonthlyReportTable('Channels (first-touch sessions)', ['Channel', 'Sessions', 'Unique visitors'], $channels, function($row) {
+                return [
+                    $row['label'] ?? '',
+                    (int) ($row['sessions'] ?? 0),
+                    (int) ($row['uniques'] ?? 0),
+                ];
+            });
+        }
+
         if(!empty($this->monthlyReportIncludeEvents)) {
             $html .= $this->renderMonthlyReportTable('Top engagement events', ['Group', 'Event', 'Label / target', 'Events'], $topEvents, function($row) {
                 return [
@@ -5071,6 +5800,16 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
                 $lines[] = '- ' . ($row['referrer_host'] ?? '') . ': ' . (int) ($row['views'] ?? 0) . ' views';
             }
             if(!$referrers) $lines[] = '- No data';
+            $lines[] = '';
+        }
+
+        if(!empty($this->monthlyReportIncludeChannels)) {
+            $channels = $this->getTopChannels($range, 8, []);
+            $lines[] = 'Channels (first-touch sessions):';
+            foreach($channels as $row) {
+                $lines[] = '- ' . ($row['label'] ?? '') . ': ' . (int) ($row['sessions'] ?? 0) . ' sessions';
+            }
+            if(!$channels) $lines[] = '- No data';
             $lines[] = '';
         }
 
