@@ -2880,6 +2880,68 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
         return $result;
     }
 
+    /**
+     * Flag one session as a bot from a caller that KNOWS it is one.
+     *
+     * markBehavioralBots() infers bots from traffic shape, and every one of its
+     * rules requires a single-hit session (or a lone 404). That puts an entire
+     * category permanently out of reach: anything that loads a form, submits it
+     * and gets the page back produces two or more hits, so no amount of
+     * threshold tuning will ever reach it. Form spam is exactly that shape.
+     *
+     * A caller holding a zero-false-positive signal — a filled honeypot, a
+     * failed challenge — can say so outright instead. Pass the RAW session id
+     * (the value the JS tracker keeps in window.PWNA.sessionId); this hashes it
+     * the same way tracking does, so callers never handle a hash themselves.
+     *
+     * Nothing is deleted: this only sets the flag reports already filter on, so
+     * the traffic stays in the tables and stays visible with include_bots (and
+     * in NativeAnalyticsBehavior via its "Exclude NativeAnalytics bot sessions"
+     * setting). Flagging is retroactive across the session's whole history.
+     *
+     * Idempotent — only rows not already flagged are touched, so calling it
+     * again for the same session (a bot resubmitting) picks up hits recorded
+     * since the last call. Hits arriving *after* the final call stay unflagged;
+     * NAB's session-level filter still excludes them because it matches any
+     * session with at least one flagged hit, but NA's own row-level reports
+     * will count them.
+     *
+     * @param string $sessionId Raw (unhashed) session id.
+     * @param string $reason Short tag for bot_reason, e.g. 'honeypot'.
+     * @return int Rows flagged across hits, events and attribution.
+     */
+    public function markSessionAsBot($sessionId, $reason = 'honeypot') {
+        $sessionId = trim((string) $sessionId);
+        if($sessionId === '') return 0;
+        // bot_reason is a short tag reports GROUP BY, alongside the classifier's
+        // own 'ua_fleet'/'ip_excessive'. Reject anything not already tag-shaped
+        // rather than stripping it down: quietly turning "Honey Pot!! <script>"
+        // into "honeypotscript" would pollute the grouping with junk values.
+        $reason = strtolower(trim((string) $reason));
+        if(!preg_match('/^[a-z0-9_]{1,64}$/', $reason)) $reason = 'honeypot';
+
+        $hash = $this->hashValue($sessionId);
+        $flagged = 0;
+        $db = $this->wire('database');
+        try {
+            foreach([self::HITS_TABLE, self::EVENTS_TABLE] as $table) {
+                $stmt = $db->prepare("UPDATE `{$table}` SET `is_bot` = 1, `bot_reason` = :reason
+                    WHERE `session_hash` = :hash AND `is_bot` = 0");
+                $stmt->execute([':reason' => $reason, ':hash' => $hash]);
+                $flagged += (int) $stmt->rowCount();
+            }
+            // The attribution row carries is_bot too, but has no bot_reason column.
+            $stmt = $db->prepare("UPDATE `" . self::ATTRIBUTION_TABLE . "` SET `is_bot` = 1
+                WHERE `session_hash` = :hash AND `is_bot` = 0");
+            $stmt->execute([':hash' => $hash]);
+            $flagged += (int) $stmt->rowCount();
+        } catch(\Throwable $e) {
+            $this->log('markSessionAsBot failed: ' . $e->getMessage());
+            return 0;
+        }
+        return $flagged;
+    }
+
     public function rebuildDailyAggregate($day) {
         $day = date('Y-m-d', strtotime($day));
         $nextDay = date('Y-m-d', strtotime($day . ' +1 day'));
