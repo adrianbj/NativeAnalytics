@@ -757,27 +757,37 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
             ],
         ];
 
+        $addedColumn = false;
         foreach($definitions as $table => $columns) {
             foreach($columns as $column => $definition) {
-                $this->ensureColumn($table, $column, $definition);
+                if($this->ensureColumn($table, $column, $definition)) $addedColumn = true;
             }
         }
 
         $this->ensureIndex(self::HITS_TABLE, 'is_bot', '`is_bot`');
         $this->ensureIndex(self::EVENTS_TABLE, 'is_bot', '`is_bot`');
 
-        $this->backfillLegacySchemaValues();
+        // Only populate columns that were just added. This module is autoload, so
+        // init() -> ensureSchema() runs on every request, and the static $done guard
+        // above is per-process rather than persistent. Calling the backfill
+        // unconditionally therefore issued nine full-table UPDATEs on every page view,
+        // AJAX call and cron run, for the entire life of the installation.
+        if($addedColumn) $this->backfillLegacySchemaValues();
     }
 
+    /**
+     * @return bool True if the column was added by this call, false if it already
+     *              existed or could not be added.
+     */
     protected function ensureColumn($table, $column, $definition) {
         $table = preg_replace('/[^a-zA-Z0-9_]+/', '', (string) $table);
         $column = preg_replace('/[^a-zA-Z0-9_]+/', '', (string) $column);
-        if($table === '' || $column === '' || trim((string) $definition) === '') return;
+        if($table === '' || $column === '' || trim((string) $definition) === '') return false;
         try {
             $db = $this->wire('database');
             $stmt = $db->prepare("SHOW COLUMNS FROM `{$table}` LIKE :column");
             $stmt->execute([':column' => $column]);
-            if($stmt->fetch(\PDO::FETCH_ASSOC)) return;
+            if($stmt->fetch(\PDO::FETCH_ASSOC)) return false;
 
             try {
                 $db->exec("ALTER TABLE `{$table}` ADD {$definition}");
@@ -791,22 +801,24 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
                     throw $firstError;
                 }
             }
+            return true;
         } catch(\Throwable $e) {
             $this->wire('log')->save('native-analytics', 'Column ensure failed for ' . $table . '.' . $column . ': ' . $e->getMessage());
         }
+        return false;
     }
 
     protected function backfillLegacySchemaValues() {
         $db = $this->wire('database');
         $updates = [
-            "UPDATE `" . self::HITS_TABLE . "` SET `created_date` = DATE(`created_at`) WHERE (`created_date` = '1970-01-01' OR `created_date` IS NULL) AND `created_at` IS NOT NULL",
-            "UPDATE `" . self::HITS_TABLE . "` SET `created_hour` = HOUR(`created_at`) WHERE `created_hour` = 0 AND `created_at` IS NOT NULL",
+            "UPDATE `" . self::HITS_TABLE . "` SET `created_date` = DATE(`created_at`) WHERE (`created_date` = '1970-01-01' OR `created_date` IS NULL) AND DATE(`created_at`) <> '1970-01-01' AND `created_at` IS NOT NULL",
+            "UPDATE `" . self::HITS_TABLE . "` SET `created_hour` = HOUR(`created_at`) WHERE `created_hour` = 0 AND HOUR(`created_at`) <> 0 AND `created_at` IS NOT NULL",
             "UPDATE `" . self::HITS_TABLE . "` SET `path_hash` = MD5(`path`) WHERE (`path_hash` = '' OR `path_hash` IS NULL) AND `path` <> ''",
             "UPDATE `" . self::HITS_TABLE . "` SET `status_code` = 200 WHERE `status_code` IS NULL OR `status_code` < 100",
             "UPDATE `" . self::SESSIONS_TABLE . "` SET `current_path_hash` = MD5(`current_path`) WHERE (`current_path_hash` = '' OR `current_path_hash` IS NULL) AND `current_path` <> ''",
             "UPDATE `" . self::SESSIONS_TABLE . "` SET `status_code` = 200 WHERE `status_code` IS NULL OR `status_code` < 100",
-            "UPDATE `" . self::EVENTS_TABLE . "` SET `created_date` = DATE(`created_at`) WHERE (`created_date` = '1970-01-01' OR `created_date` IS NULL) AND `created_at` IS NOT NULL",
-            "UPDATE `" . self::EVENTS_TABLE . "` SET `created_hour` = HOUR(`created_at`) WHERE `created_hour` = 0 AND `created_at` IS NOT NULL",
+            "UPDATE `" . self::EVENTS_TABLE . "` SET `created_date` = DATE(`created_at`) WHERE (`created_date` = '1970-01-01' OR `created_date` IS NULL) AND DATE(`created_at`) <> '1970-01-01' AND `created_at` IS NOT NULL",
+            "UPDATE `" . self::EVENTS_TABLE . "` SET `created_hour` = HOUR(`created_at`) WHERE `created_hour` = 0 AND HOUR(`created_at`) <> 0 AND `created_at` IS NOT NULL",
             "UPDATE `" . self::EVENTS_TABLE . "` SET `path_hash` = MD5(`path`) WHERE (`path_hash` = '' OR `path_hash` IS NULL) AND `path` <> ''",
         ];
         foreach($updates as $sql) {
