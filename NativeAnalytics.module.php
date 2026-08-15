@@ -16,6 +16,7 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
     const CURRENT_VISITORS_FETCH_LIMIT = 1000;
 
     protected $defaults = [
+        'schemaCheckedVersion' => 0,
         'trackingEnabled' => 1,
         'respectDnt' => 1,
         'requireConsent' => 0,
@@ -423,6 +424,24 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
     protected function ensureSchema($force = false) {
         static $done = false;
         if($done && !$force) return;
+
+        // The static above is per PHP process, and this module is autoload, so before
+        // this check ensureSchema() ran its full sweep on every request: a
+        // CREATE TABLE IF NOT EXISTS per table, one SHOW COLUMNS per column definition
+        // (around 58 of them) and a SHOW INDEX per index. On an install whose database
+        // is not on localhost that is ~90ms of round trips added to every page view,
+        // front end and admin alike, forever.
+        //
+        // Record the module version that last completed the sweep and skip it while
+        // that still matches. Keying on the module version rather than a separate
+        // schema constant means any release re-runs the checks once, automatically,
+        // with nothing for a maintainer to remember to bump.
+        $moduleVersion = (int) $this->wire('modules')->getModuleInfoProperty($this, 'version');
+        if(!$force && $moduleVersion && (int) $this->schemaCheckedVersion === $moduleVersion) {
+            $done = true;
+            return;
+        }
+
         $db = $this->wire('database');
 
         $db->exec("CREATE TABLE IF NOT EXISTS `" . self::HITS_TABLE . "` (
@@ -640,6 +659,17 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
         $this->ensureIndex(self::EVENTS_TABLE, 'bot_created', '`is_bot`, `created_at`');
 
         $done = true;
+
+        // Remember that this module version has completed the sweep, so subsequent
+        // requests skip it until the next release.
+        if($moduleVersion && (int) $this->schemaCheckedVersion !== $moduleVersion) {
+            try {
+                $this->schemaCheckedVersion = $moduleVersion;
+                $this->wire('modules')->saveConfig($this, 'schemaCheckedVersion', $moduleVersion);
+            } catch(\Throwable $e) {
+                // never let a config write break the request
+            }
+        }
     }
 
     /**
