@@ -2913,6 +2913,25 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
     public function markSessionAsBot($sessionId, $reason = 'honeypot') {
         $sessionId = trim((string) $sessionId);
         if($sessionId === '') return 0;
+        return $this->markSessionHashAsBot($this->hashValue($sessionId), $reason);
+    }
+
+    /**
+     * markSessionAsBot() for a caller that only has the session HASH.
+     *
+     * Raw session ids are short-lived — they live in the visitor's
+     * sessionStorage and are never stored — so anything working over history
+     * (a backfill, a report drilling down from a flagged row) has only the
+     * hash. Same guarantees as markSessionAsBot(): nothing is deleted, only
+     * unflagged rows are touched, and it is safe to run repeatedly.
+     *
+     * @param string $sessionHash 64-char sha256 session hash.
+     * @param string $reason Short tag for bot_reason.
+     * @return int Rows flagged across hits, events and attribution.
+     */
+    public function markSessionHashAsBot($sessionHash, $reason = 'honeypot') {
+        $hash = trim((string) $sessionHash);
+        if(!preg_match('/^[a-f0-9]{64}$/i', $hash)) return 0;
         // bot_reason is a short tag reports GROUP BY, alongside the classifier's
         // own 'ua_fleet'/'ip_excessive'. Reject anything not already tag-shaped
         // rather than stripping it down: quietly turning "Honey Pot!! <script>"
@@ -2920,7 +2939,6 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
         $reason = strtolower(trim((string) $reason));
         if(!preg_match('/^[a-z0-9_]{1,64}$/', $reason)) $reason = 'honeypot';
 
-        $hash = $this->hashValue($sessionId);
         $flagged = 0;
         $db = $this->wire('database');
         try {
@@ -2936,8 +2954,11 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
             $stmt->execute([':hash' => $hash]);
             $flagged += (int) $stmt->rowCount();
         } catch(\Throwable $e) {
-            $this->log('markSessionAsBot failed: ' . $e->getMessage());
-            return 0;
+            // Report what actually landed, not 0: the updates run table by
+            // table, so a failure on a later one leaves the earlier ones
+            // committed. Returning 0 there would tell the caller nothing
+            // happened while rows were in fact flagged.
+            $this->log('markSessionHashAsBot failed after ' . $flagged . ' rows: ' . $e->getMessage());
         }
         return $flagged;
     }
