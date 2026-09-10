@@ -4,7 +4,7 @@ require_once __DIR__ . '/lib/like-escape.php';
 
 class NativeAnalytics extends WireData implements Module, ConfigurableModule {
 
-    const VERSION = '1.0.31';
+    const VERSION = '1.0.32';
     const HITS_TABLE = 'pwna_hits';
     const DAILY_TABLE = 'pwna_daily';
     const SESSIONS_TABLE = 'pwna_sessions';
@@ -16,6 +16,8 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
     const CURRENT_VISITORS_FETCH_LIMIT = 1000;
 
     protected $defaults = [
+        'schemaCheckedVersion' => 0,
+        'schemaBackfillPending' => 0,
         'trackingEnabled' => 1,
         'respectDnt' => 1,
         'requireConsent' => 0,
@@ -68,7 +70,7 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
         return [
             'title' => 'NativeAnalytics',
             'summary' => 'Native first-party analytics dashboard for ProcessWire with traffic, acquisition channels, funnels, compare, exports, event tracking and goals.',
-            'version' => 1031,
+            'version' => 1032,
             'author' => 'Pyxios - Roych (www.pyxios.com)',
             'href' => 'https://processwire.com/talk/topic/31808-native-analytics-%E2%80%94-a-native-analytics-module-for-processwire/',
             'repo' => 'https://github.com/Roychgod/NativeAnalytics',
@@ -423,7 +425,20 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
     protected function ensureSchema($force = false) {
         static $done = false;
         if($done && !$force) return;
+
+        // This module is autoloaded, so init() runs on every request. Persist the
+        // module version that last completed the schema sweep and skip the expensive
+        // SHOW COLUMNS / SHOW INDEX checks until the module version changes. Install
+        // and upgrade paths still call ensureSchema(true), so lifecycle migrations
+        // always force a complete schema check.
+        $moduleVersion = (int) $this->wire('modules')->getModuleInfoProperty($this, 'version');
+        if(!$force && $moduleVersion > 0 && (int) $this->schemaCheckedVersion === $moduleVersion) {
+            $done = true;
+            return;
+        }
+
         $db = $this->wire('database');
+        $schemaOk = true;
 
         $db->exec("CREATE TABLE IF NOT EXISTS `" . self::HITS_TABLE . "` (
             `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -618,28 +633,35 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
             KEY `bot_created` (`is_bot`, `created_at`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
 
-        $this->ensureLegacySchemaColumns();
+        if(!$this->ensureLegacySchemaColumns()) $schemaOk = false;
 
-        $this->ensureIndex(self::HITS_TABLE, 'created_status', '`created_at`, `status_code`');
-        $this->ensureIndex(self::HITS_TABLE, 'created_page', '`created_at`, `page_id`');
-        $this->ensureIndex(self::HITS_TABLE, 'created_template', '`created_at`, `template`');
-        $this->ensureIndex(self::HITS_TABLE, 'created_path', '`created_at`, `path_hash`');
-        $this->ensureIndex(self::HITS_TABLE, 'created_session', '`created_at`, `session_hash`');
+        if(!$this->ensureIndex(self::HITS_TABLE, 'created_status', '`created_at`, `status_code`')) $schemaOk = false;
+        if(!$this->ensureIndex(self::HITS_TABLE, 'created_page', '`created_at`, `page_id`')) $schemaOk = false;
+        if(!$this->ensureIndex(self::HITS_TABLE, 'created_template', '`created_at`, `template`')) $schemaOk = false;
+        if(!$this->ensureIndex(self::HITS_TABLE, 'created_path', '`created_at`, `path_hash`')) $schemaOk = false;
+        if(!$this->ensureIndex(self::HITS_TABLE, 'created_session', '`created_at`, `session_hash`')) $schemaOk = false;
         // Almost every report and every daily-aggregate rebuild filters
         // `is_bot = 0` over a `created_at` range. Equality column first, range
         // second is the optimal order for that access pattern.
-        $this->ensureIndex(self::HITS_TABLE, 'bot_created', '`is_bot`, `created_at`');
+        if(!$this->ensureIndex(self::HITS_TABLE, 'bot_created', '`is_bot`, `created_at`')) $schemaOk = false;
         // Serves the ip_excessive bot rule (GROUP BY ip_hash, created_date,
         // created_hour) and the IP-based 404/suspicious-path cleanup deletes.
         // The hits table previously had no ip_hash index at all.
-        $this->ensureIndex(self::HITS_TABLE, 'ip_created', '`ip_hash`, `created_date`, `created_hour`');
-        $this->ensureIndex(self::EVENTS_TABLE, 'created_group_name', '`created_at`, `event_group`, `event_name`');
-        $this->ensureIndex(self::EVENTS_TABLE, 'created_page', '`created_at`, `page_id`');
-        $this->ensureIndex(self::EVENTS_TABLE, 'created_template', '`created_at`, `template`');
-        $this->ensureIndex(self::EVENTS_TABLE, 'created_session', '`created_at`, `session_hash`');
-        $this->ensureIndex(self::EVENTS_TABLE, 'bot_created', '`is_bot`, `created_at`');
+        if(!$this->ensureIndex(self::HITS_TABLE, 'ip_created', '`ip_hash`, `created_date`, `created_hour`')) $schemaOk = false;
+        if(!$this->ensureIndex(self::EVENTS_TABLE, 'created_group_name', '`created_at`, `event_group`, `event_name`')) $schemaOk = false;
+        if(!$this->ensureIndex(self::EVENTS_TABLE, 'created_page', '`created_at`, `page_id`')) $schemaOk = false;
+        if(!$this->ensureIndex(self::EVENTS_TABLE, 'created_template', '`created_at`, `template`')) $schemaOk = false;
+        if(!$this->ensureIndex(self::EVENTS_TABLE, 'created_session', '`created_at`, `session_hash`')) $schemaOk = false;
+        if(!$this->ensureIndex(self::EVENTS_TABLE, 'bot_created', '`is_bot`, `created_at`')) $schemaOk = false;
 
         $done = true;
+
+        // Only mark this version as checked when every recoverable schema operation
+        // succeeded. A transient ALTER/INDEX/backfill failure is then retried on the
+        // next request instead of being hidden until the next release.
+        if($schemaOk && $moduleVersion > 0 && (int) $this->schemaCheckedVersion !== $moduleVersion) {
+            $this->saveConfigValue('schemaCheckedVersion', $moduleVersion);
+        }
     }
 
     /**
@@ -757,27 +779,50 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
             ],
         ];
 
+        $addedColumn = false;
+        $schemaOk = true;
         foreach($definitions as $table => $columns) {
             foreach($columns as $column => $definition) {
-                $this->ensureColumn($table, $column, $definition);
+                $result = $this->ensureColumn($table, $column, $definition);
+                if($result > 0) $addedColumn = true;
+                elseif($result < 0) $schemaOk = false;
             }
         }
 
-        $this->ensureIndex(self::HITS_TABLE, 'is_bot', '`is_bot`');
-        $this->ensureIndex(self::EVENTS_TABLE, 'is_bot', '`is_bot`');
+        if(!$this->ensureIndex(self::HITS_TABLE, 'is_bot', '`is_bot`')) $schemaOk = false;
+        if(!$this->ensureIndex(self::EVENTS_TABLE, 'is_bot', '`is_bot`')) $schemaOk = false;
 
-        $this->backfillLegacySchemaValues();
+        // If a backfill is interrupted (for example by a deadlock), keep a small
+        // persistent pending flag so it is retried even though the added columns
+        // already exist on the next request.
+        if($addedColumn) {
+            $this->saveConfigValue('schemaBackfillPending', 1);
+        }
+        if($addedColumn || !empty($this->schemaBackfillPending)) {
+            if($this->backfillLegacySchemaValues()) {
+                $this->saveConfigValue('schemaBackfillPending', 0);
+            } else {
+                $schemaOk = false;
+            }
+        }
+
+        return $schemaOk;
     }
 
+    /**
+     * Ensure a legacy column exists.
+     *
+     * @return int 1 when added, 0 when already present, -1 on failure.
+     */
     protected function ensureColumn($table, $column, $definition) {
         $table = preg_replace('/[^a-zA-Z0-9_]+/', '', (string) $table);
         $column = preg_replace('/[^a-zA-Z0-9_]+/', '', (string) $column);
-        if($table === '' || $column === '' || trim((string) $definition) === '') return;
+        if($table === '' || $column === '' || trim((string) $definition) === '') return -1;
         try {
             $db = $this->wire('database');
             $stmt = $db->prepare("SHOW COLUMNS FROM `{$table}` LIKE :column");
             $stmt->execute([':column' => $column]);
-            if($stmt->fetch(\PDO::FETCH_ASSOC)) return;
+            if($stmt->fetch(\PDO::FETCH_ASSOC)) return 0;
 
             try {
                 $db->exec("ALTER TABLE `{$table}` ADD {$definition}");
@@ -791,42 +836,53 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
                     throw $firstError;
                 }
             }
+            return 1;
         } catch(\Throwable $e) {
             $this->wire('log')->save('native-analytics', 'Column ensure failed for ' . $table . '.' . $column . ': ' . $e->getMessage());
         }
+        return -1;
     }
 
     protected function backfillLegacySchemaValues() {
         $db = $this->wire('database');
+        $ok = true;
         $updates = [
-            "UPDATE `" . self::HITS_TABLE . "` SET `created_date` = DATE(`created_at`) WHERE (`created_date` = '1970-01-01' OR `created_date` IS NULL) AND `created_at` IS NOT NULL",
-            "UPDATE `" . self::HITS_TABLE . "` SET `created_hour` = HOUR(`created_at`) WHERE `created_hour` = 0 AND `created_at` IS NOT NULL",
+            "UPDATE `" . self::HITS_TABLE . "` SET `created_date` = DATE(`created_at`) WHERE (`created_date` = '1970-01-01' OR `created_date` IS NULL) AND DATE(`created_at`) <> '1970-01-01' AND `created_at` IS NOT NULL",
+            "UPDATE `" . self::HITS_TABLE . "` SET `created_hour` = HOUR(`created_at`) WHERE `created_hour` = 0 AND HOUR(`created_at`) <> 0 AND `created_at` IS NOT NULL",
             "UPDATE `" . self::HITS_TABLE . "` SET `path_hash` = MD5(`path`) WHERE (`path_hash` = '' OR `path_hash` IS NULL) AND `path` <> ''",
             "UPDATE `" . self::HITS_TABLE . "` SET `status_code` = 200 WHERE `status_code` IS NULL OR `status_code` < 100",
             "UPDATE `" . self::SESSIONS_TABLE . "` SET `current_path_hash` = MD5(`current_path`) WHERE (`current_path_hash` = '' OR `current_path_hash` IS NULL) AND `current_path` <> ''",
             "UPDATE `" . self::SESSIONS_TABLE . "` SET `status_code` = 200 WHERE `status_code` IS NULL OR `status_code` < 100",
-            "UPDATE `" . self::EVENTS_TABLE . "` SET `created_date` = DATE(`created_at`) WHERE (`created_date` = '1970-01-01' OR `created_date` IS NULL) AND `created_at` IS NOT NULL",
-            "UPDATE `" . self::EVENTS_TABLE . "` SET `created_hour` = HOUR(`created_at`) WHERE `created_hour` = 0 AND `created_at` IS NOT NULL",
+            "UPDATE `" . self::EVENTS_TABLE . "` SET `created_date` = DATE(`created_at`) WHERE (`created_date` = '1970-01-01' OR `created_date` IS NULL) AND DATE(`created_at`) <> '1970-01-01' AND `created_at` IS NOT NULL",
+            "UPDATE `" . self::EVENTS_TABLE . "` SET `created_hour` = HOUR(`created_at`) WHERE `created_hour` = 0 AND HOUR(`created_at`) <> 0 AND `created_at` IS NOT NULL",
             "UPDATE `" . self::EVENTS_TABLE . "` SET `path_hash` = MD5(`path`) WHERE (`path_hash` = '' OR `path_hash` IS NULL) AND `path` <> ''",
         ];
         foreach($updates as $sql) {
-            try { $db->exec($sql); } catch(\Throwable $e) {}
+            try {
+                $db->exec($sql);
+            } catch(\Throwable $e) {
+                $ok = false;
+                $this->wire('log')->save('native-analytics', 'Legacy schema backfill failed: ' . $e->getMessage());
+            }
         }
+        return $ok;
     }
 
     protected function ensureIndex($table, $name, $columns) {
         $table = preg_replace('/[^a-zA-Z0-9_]+/', '', (string) $table);
         $name = preg_replace('/[^a-zA-Z0-9_]+/', '', (string) $name);
-        if($table === '' || $name === '' || trim((string) $columns) === '') return;
+        if($table === '' || $name === '' || trim((string) $columns) === '') return false;
         try {
             $db = $this->wire('database');
             $stmt = $db->prepare("SHOW INDEX FROM `{$table}` WHERE Key_name = :name");
             $stmt->execute([':name' => $name]);
-            if($stmt->fetch(\PDO::FETCH_ASSOC)) return;
+            if($stmt->fetch(\PDO::FETCH_ASSOC)) return true;
             $db->exec("ALTER TABLE `{$table}` ADD KEY `{$name}` ({$columns})");
+            return true;
         } catch(\Throwable $e) {
             $this->wire('log')->save('native-analytics', 'Index ensure failed for ' . $table . '.' . $name . ': ' . $e->getMessage());
         }
+        return false;
     }
 
     protected function createPermission($name, $title) {
@@ -846,6 +902,8 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
     public static function getModuleConfigInputfields(array $data) {
         $wire = wire();
         $defaults = [
+            'schemaCheckedVersion' => 0,
+            'schemaBackfillPending' => 0,
             'trackingEnabled' => 1,
             'respectDnt' => 1,
             'requireConsent' => 0,
@@ -1210,6 +1268,19 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
                 . '<p class="description">Save any changed retention values first. "Purge old data now" applies the retention limits above immediately; "Reclaim disk space now" rebuilds the tables so freed space returns to the filesystem.</p>';
             $wrapper->add($f);
         }
+
+        // Internal runtime marker. Keep it in the configuration form as a hidden
+        // value so saving normal module settings does not wipe the persisted schema
+        // check state and re-enable a full schema sweep on every request.
+        $f = $wire->modules->get('InputfieldHidden');
+        $f->name = 'schemaCheckedVersion';
+        $f->value = (int) ($data['schemaCheckedVersion'] ?? 0);
+        $wrapper->add($f);
+
+        $f = $wire->modules->get('InputfieldHidden');
+        $f->name = 'schemaBackfillPending';
+        $f->value = !empty($data['schemaBackfillPending']) ? 1 : 0;
+        $wrapper->add($f);
 
         $f = $wire->modules->get('InputfieldHidden');
         $f->name = 'lastPurgeAt';

@@ -1,10 +1,10 @@
-NativeAnalytics 1.0.31
+NativeAnalytics 1.0.32
 
 # NativeAnalytics
 
 Native first-party analytics module for ProcessWire CMS. It tracks traffic and engagement directly inside ProcessWire, without Google Analytics or external APIs.
 
-## Features in v1.0.31
+## Features in v1.0.32
 
 NativeAnalytics is a first-party analytics dashboard for ProcessWire. It keeps the tracking data inside your ProcessWire installation and does not rely on Google Analytics, external tracking scripts or remote analytics APIs.
 
@@ -252,6 +252,17 @@ Thanks to **[adrianbj](https://github.com/adrianbj)** for all five improvements 
 
 - **Fixed the tracking endpoint being recorded as a pageview.** On some setups (ProcessWire installed in a subdirectory, behind a reverse proxy, or where the `/pwna-track/` request was not recognised as the analytics endpoint) the endpoint's own path could leak into stored hits. The result was that **Top pages**, **Top landing pages** and **Top exit pages** all showed only `/pwna-track/`, with sessions started equal to sessions ended. A new `isEndpointPath()` guard now hard-excludes `/pwna-track/` and `/pwna-realtime/` from being stored as a pageview or event, and the `getRequestPathForStorage()` fallback can no longer return an endpoint path. Existing `/pwna-track/` rows can be cleaned up via the suspicious-path removal tool.
 - Updated module version metadata to `1.0.27` / integer `1027`.
+
+## 1.0.32 notes
+
+### Performance / schema maintenance
+- Fixed an autoload performance issue where the full schema sweep (`SHOW COLUMNS`, `SHOW INDEX` and related checks) could run on every request. The completed schema-check version is now persisted and the sweep only runs again when the module version changes, while install/upgrade still force a full check.
+- Legacy schema backfill UPDATEs now run only when a missing legacy column was actually added instead of on every request.
+- Corrected the legacy `created_hour` / `created_date` backfill predicates so legitimate midnight (`0`) and `1970-01-01` values do not keep matching forever.
+- The internal schema-check marker is preserved when normal module settings are saved.
+- Updated all NativeAnalytics and dashboard module version metadata to `1.0.32` / integer `1032`.
+
+Thanks to **[adrianbj](https://github.com/adrianbj)** for identifying and profiling the issue in PR #19.
 
 ## 1.0.31 notes
 
