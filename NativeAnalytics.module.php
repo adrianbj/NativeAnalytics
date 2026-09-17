@@ -4,7 +4,7 @@ require_once __DIR__ . '/lib/like-escape.php';
 
 class NativeAnalytics extends WireData implements Module, ConfigurableModule {
 
-    const VERSION = '1.0.32';
+    const VERSION = '1.0.33';
     const HITS_TABLE = 'pwna_hits';
     const DAILY_TABLE = 'pwna_daily';
     const SESSIONS_TABLE = 'pwna_sessions';
@@ -64,13 +64,14 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
         'botFleetWindowMinutes' => 240,
         'botIpMaxHitsPerHour' => 30,
         'bot404ShowBots' => 0,
+        'deleteDataOnUninstall' => 0,
     ];
 
     public static function getModuleInfo() {
         return [
             'title' => 'NativeAnalytics',
             'summary' => 'Native first-party analytics dashboard for ProcessWire with traffic, acquisition channels, funnels, compare, exports, event tracking and goals.',
-            'version' => 1032,
+            'version' => 1033,
             'author' => 'Pyxios - Roych (www.pyxios.com)',
             'href' => 'https://processwire.com/talk/topic/31808-native-analytics-%E2%80%94-a-native-analytics-module-for-processwire/',
             'repo' => 'https://github.com/Roychgod/NativeAnalytics',
@@ -168,6 +169,26 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
 
     public function getTrackEndpointUrl() {
         return $this->wire('config')->urls->root . 'pwna-track/';
+    }
+
+    /**
+     * Absolute tracking endpoint URL for server-to-server diagnostics.
+     * Browser tracking intentionally uses getTrackEndpointUrl(), which may be
+     * root-relative. WireHttp, however, requires an absolute HTTP(S) URL.
+     */
+    protected function getTrackEndpointHttpUrl() {
+        $config = $this->wire('config');
+        $relative = (string) $this->getTrackEndpointUrl();
+        if(preg_match('#^https?://#i', $relative)) return $relative;
+
+        $scheme = !empty($config->https) ? 'https' : 'http';
+        $host = trim((string) ($config->httpHost ?? ''));
+        if($host === '' && !empty($_SERVER['HTTP_HOST'])) $host = trim((string) $_SERVER['HTTP_HOST']);
+        if($host === '') return '';
+        // httpHost/HTTP_HOST is used only as a host component; reject values
+        // containing characters that could turn this into an arbitrary URL.
+        if(!preg_match('/^[a-z0-9.\-\[\]:]+$/i', $host)) return '';
+        return $scheme . '://' . $host . '/' . ltrim($relative, '/');
     }
 
     public function getRealtimeEndpointUrl() {
@@ -292,14 +313,18 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
             if((string) $session->getFor('NativeAnalytics', 'uninstall_mode') !== 'dashboard-direct') {
                 $this->uninstallDashboardModule();
             }
-            $db = $this->wire('database');
-            $db->exec("DROP TABLE IF EXISTS `" . self::GOAL_DAILY_TABLE . "`");
-            $db->exec("DROP TABLE IF EXISTS `" . self::GOALS_TABLE . "`");
-            $db->exec("DROP TABLE IF EXISTS `" . self::EVENT_DAILY_TABLE . "`");
-            $db->exec("DROP TABLE IF EXISTS `" . self::EVENTS_TABLE . "`");
-            $db->exec("DROP TABLE IF EXISTS `" . self::SESSIONS_TABLE . "`");
-            $db->exec("DROP TABLE IF EXISTS `" . self::DAILY_TABLE . "`");
-            $db->exec("DROP TABLE IF EXISTS `" . self::HITS_TABLE . "`");
+            // Preserve collected analytics by default. This makes an accidental
+            // uninstall/reinstall recoverable. Administrators can explicitly opt
+            // into destructive removal in the module settings before uninstalling.
+            if(!empty($this->deleteDataOnUninstall)) {
+                $db = $this->wire('database');
+                foreach([self::GOAL_DAILY_TABLE, self::GOALS_TABLE, self::EVENT_DAILY_TABLE, self::EVENTS_TABLE, self::ATTRIBUTION_TABLE, self::SESSIONS_TABLE, self::DAILY_TABLE, self::HITS_TABLE] as $table) {
+                    $db->exec("DROP TABLE IF EXISTS `{$table}`");
+                }
+                $this->wire('log')->save('native-analytics', 'Module uninstalled and analytics tables removed by explicit configuration.');
+            } else {
+                $this->wire('log')->save('native-analytics', 'Module uninstalled; analytics tables were preserved for a future reinstall.');
+            }
             $this->deletePermission('nativeanalytics-view');
             $this->deletePermission('nativeanalytics-manage');
             $this->cleanupDashboardAdminPage();
@@ -1269,6 +1294,52 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
             $wrapper->add($f);
         }
 
+        // Tracking health / diagnostics. Designed to explain the common "all zero"
+        // situation without requiring Tracy or direct database access.
+        if($module instanceof self) {
+            $diag = $module->getTrackingDiagnostics();
+            $health = $diag['health'];
+            $testUrl = $baseConfigUrl . '&pwna_maintenance_action=tracking_test&' . rawurlencode($tokenName) . '=' . rawurlencode($tokenValue);
+            $state = !empty($diag['ok']) ? 'OK' : 'Needs attention';
+            $details = '<ul style="margin:.4em 0 1em 1.2em">';
+            $details .= '<li><strong>Tracking:</strong> ' . (!empty($data['trackingEnabled']) ? 'Enabled' : 'Disabled') . '</li>';
+            $details .= '<li><strong>Mode:</strong> ' . $wire->sanitizer->entities((string) $diag['mode']) . '</li>';
+            $details .= '<li><strong>Storage:</strong> ' . $wire->sanitizer->entities((string) $diag['storage']) . '</li>';
+            $details .= '<li><strong>Tracker asset:</strong> ' . (!empty($diag['tracker_asset']) ? 'Available' : 'Missing') . '</li>';
+            $details .= '<li><strong>Raw hits:</strong> ' . number_format((int) ($health['hits_count'] ?? 0)) . '</li>';
+            $details .= '<li><strong>Last hit:</strong> ' . $wire->sanitizer->entities(trim((string) ($health['last_hit_at'] ?? '')) ?: 'never') . '</li></ul>';
+            foreach($diag['issues'] as $message) $details .= '<p class="uk-alert-danger pwna-diagnostic-message"><strong>Problem:</strong> ' . $wire->sanitizer->entities($message) . '</p>';
+            foreach($diag['warnings'] as $message) $details .= '<p class="description">' . $wire->sanitizer->entities($message) . '</p>';
+            $f = $wire->modules->get('InputfieldMarkup');
+            $f->name = 'trackingHealth';
+            $f->showIf = 'trackingEnabled=1';
+            $f->label = 'Tracking health & diagnostics';
+            // Consume a one-time diagnostic result before rendering this visible
+            // Inputfield. Previously the dialog lived in a collapsedHidden
+            // InputfieldMarkup; some admin themes correctly omit collapsedHidden
+            // markup altogether, so the modal never reached the DOM. Keeping the
+            // dialog inside the visible diagnostics field is theme-independent.
+            $diagResult = $wire->session->getFor('NativeAnalytics', 'trackingDiagnosticResult');
+            $diagResultHtml = '';
+            if(is_array($diagResult)) {
+                $wire->session->removeFor('NativeAnalytics', 'trackingDiagnosticResult');
+                $diagResultHtml = self::renderTrackingDiagnosticResultModal($diagResult);
+            }
+            $f->value = '<p><strong>Status: ' . $wire->sanitizer->entities($state) . '</strong></p>' . $details
+                . '<p><a class="ui-button ui-priority-secondary" href="' . $wire->sanitizer->entities($testUrl) . '"><i class="fa fa-stethoscope"></i> Run tracking test</a></p>'
+                . '<p class="description">The test verifies that the analytics schema can be read and that the raw hits table accepts writes. It uses a transaction and rolls the test row back, so statistics are not changed.</p>'
+                . $diagResultHtml;
+            $wrapper->add($f);
+        }
+
+        // Destructive uninstall is deliberately opt-in.
+        $f = $wire->modules->get('InputfieldCheckbox');
+        $f->name = 'deleteDataOnUninstall';
+        $f->label = 'Delete collected analytics data when uninstalling';
+        $f->checked = !empty($data['deleteDataOnUninstall']);
+        $f->description = 'Dangerous. Leave disabled to preserve analytics tables if the module is accidentally uninstalled or you plan to reinstall it. Enable only when you intentionally want all NativeAnalytics database data removed during uninstall.';
+        $wrapper->add($f);
+
         // Internal runtime marker. Keep it in the configuration form as a hidden
         // value so saving normal module settings does not wipe the persisted schema
         // check state and re-enable a full schema sweep on every request.
@@ -2068,6 +2139,17 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
         $mode = $this->getTrackingMode();
         $jsIsPrimary = ($mode === 'js_first' || $mode === 'js_only');
 
+        // A short HTML meta refresh can navigate away before a deferred browser
+        // tracker gets a chance to run. In JS-first mode, record that rendered
+        // redirect page server-side and suppress the duplicate client pageview.
+        // This keeps normal pages JS-first while making deliberate redirect pages
+        // reliable even with very short refresh delays.
+        $metaRefreshFallback = false;
+        if($jsIsPrimary && $this->containsMetaRefresh($html) && $this->shouldTrackCurrentRequest()) {
+            $this->trackCurrentRequestServerSide();
+            $metaRefreshFallback = true;
+        }
+
         $payload = [
             'trackEndpoint' => $this->getTrackEndpointUrl(),
             'path' => $this->getRequestPathForStorage(),
@@ -2079,10 +2161,10 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
             'consentCookieName' => (string) $this->consentCookieName,
             'respectDnt' => (bool) $this->respectDnt,
             // When JS is the primary source of pageviews, fire one on load.
-            'autoTrack' => $jsIsPrimary,
+            'autoTrack' => $jsIsPrimary && !$metaRefreshFallback,
             // When server-side is disabled and consent is needed, JS must still fire
             // the pageview after consent is given.
-            'needsClientPageview' => $jsIsPrimary || (bool) ($this->requireConsent && !$this->hasConsentCookie()),
+            'needsClientPageview' => (!$metaRefreshFallback && $jsIsPrimary) || (bool) ($this->requireConsent && !$this->hasConsentCookie()),
             'eventTracking' => (bool) $this->eventTrackingEnabled,
             'storageMode' => $this->getTrackingStorageMode(),
             'privacyWireAutoConsent' => (bool) $this->privacyWireAutoConsent,
@@ -2107,15 +2189,29 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
         }
     }
 
+    /**
+     * Detect an HTML meta refresh in rendered markup. Attribute order and quote
+     * style are intentionally flexible; only a real <meta> tag with an
+     * http-equiv=refresh attribute qualifies.
+     */
+    protected function containsMetaRefresh($html) {
+        $html = (string) $html;
+        if($html === '' || stripos($html, '<meta') === false || stripos($html, 'refresh') === false) return false;
+        if(!preg_match_all('/<meta\b[^>]*>/i', $html, $matches)) return false;
+        foreach($matches[0] as $tag) {
+            if(preg_match("~\bhttp-equiv\s*=\s*(['\"]?)refresh\1(?:\s|/?>|$)~i", $tag)) return true;
+        }
+        return false;
+    }
+
     protected function maybeHandleSpecialEndpoints() {
         $requestUri = isset($_SERVER['REQUEST_URI']) ? (string) $_SERVER['REQUEST_URI'] : '';
         if($requestUri === '') return;
-        $requestPath = (string) parse_url($requestUri, PHP_URL_PATH);
-        $normalized = rtrim($this->normalizePath($requestPath), '/');
-        if($normalized === '/pwna-track') {
+        $endpoint = $this->getSpecialEndpointFromUri($requestUri);
+        if($endpoint === 'track') {
             $this->handleTrackingRequest();
         }
-        if($normalized === '/pwna-realtime') {
+        if($endpoint === 'realtime') {
             $this->handleRealtimeRequest();
         }
         if((int) $this->wire('input')->get('pwna_event') === 1) {
@@ -2573,12 +2669,18 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
         return $this->normalizePath((string) parse_url($requestUri, PHP_URL_PATH));
     }
 
+    protected function getSpecialEndpointFromUri($requestUri) {
+        $requestPath = (string) parse_url((string) $requestUri, PHP_URL_PATH);
+        if($requestPath === '') return '';
+        $normalized = rtrim($this->normalizePath($requestPath), '/');
+        if($normalized === '/pwna-track') return 'track';
+        if($normalized === '/pwna-realtime') return 'realtime';
+        return '';
+    }
+
     protected function isTrackingEndpointRequest() {
         $requestUri = isset($_SERVER['REQUEST_URI']) ? (string) $_SERVER['REQUEST_URI'] : '';
-        if($requestUri === '') return false;
-        $requestPath = (string) parse_url($requestUri, PHP_URL_PATH);
-        $normalized = rtrim($this->normalizePath($requestPath), '/');
-        return $normalized === '/pwna-track';
+        return $requestUri !== '' && $this->getSpecialEndpointFromUri($requestUri) === 'track';
     }
 
     /**
@@ -3318,11 +3420,24 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
 
     protected function saveConfigValue($key, $value) {
         $this->set($key, $value);
+
+        // Modules::saveConfig() persists the array supplied to it as the module's
+        // configuration. Passing only one runtime marker here can therefore wipe
+        // user settings (tracking mode, storage mode, consent options, etc.).
+        // Always merge the marker into the currently persisted configuration.
         try {
-            $this->wire('modules')->saveConfig($this, [$key => $value]);
+            $modules = $this->wire('modules');
+            $config = $modules->getConfig($this);
+            if(!is_array($config)) $config = [];
+            $config[$key] = $value;
+            $modules->saveConfig($this, $config);
         } catch(\Throwable $e) {
             try {
-                $this->wire('modules')->saveConfig('NativeAnalytics', [$key => $value]);
+                $modules = $this->wire('modules');
+                $config = $modules->getConfig('NativeAnalytics');
+                if(!is_array($config)) $config = [];
+                $config[$key] = $value;
+                $modules->saveConfig('NativeAnalytics', $config);
             } catch(\Throwable $e2) {
                 $this->wire('log')->save('native-analytics', 'Could not save config value ' . $key . ': ' . $e2->getMessage());
             }
@@ -4753,6 +4868,180 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
         return $html;
     }
 
+    /**
+     * Read-only diagnostics used by the module settings health panel.
+     * No visitor data is created by this method.
+     */
+    public function getTrackingDiagnostics() {
+        $rawMode = (string) ($this->trackingMode ?? '');
+        $rawStorage = (string) ($this->trackingStorageMode ?? '');
+        $mode = $this->getTrackingMode();
+        $storage = $this->getTrackingStorageMode();
+        $health = $this->getHealthSnapshot();
+        $issues = [];
+        $warnings = [];
+
+        if(empty($this->trackingEnabled)) $issues[] = 'Tracking is disabled.';
+        if(!in_array($rawMode, ['js_first', 'js_only', 'both', 'server_only'], true)) $issues[] = 'The persisted tracking mode is missing or invalid; save the module settings again.';
+        if(!in_array($rawStorage, ['cookie', 'cookieless'], true)) $issues[] = 'The persisted storage mode is missing or invalid; save the module settings again.';
+        if((int) ($health['hits_count'] ?? -1) < 0) $issues[] = 'The raw hits table cannot be read.';
+        if((int) ($health['sessions_count'] ?? -1) < 0) $issues[] = 'The realtime sessions table cannot be read.';
+        if(!empty($this->requireConsent) && trim((string) $this->consentCookieName) === '') $issues[] = 'Consent is required but no consent cookie name is configured.';
+        if(($mode === 'js_first' || $mode === 'js_only') && !is_file(__DIR__ . '/assets/tracker.js')) $issues[] = 'Browser tracker asset is missing.';
+        if((int) ($health['hits_count'] ?? 0) === 0 && !empty($this->trackingEnabled)) $warnings[] = 'No pageviews have been stored yet.';
+        if($this->isRoleExcluded()) $warnings[] = 'Your current logged-in role is excluded from tracking; this is normal for administrators.';
+        if(!empty($this->respectDnt)) $warnings[] = 'Do Not Track requests are ignored by analytics as configured.';
+        if(!empty($this->requireConsent)) $warnings[] = 'Tracking waits for the configured consent cookie.';
+
+        return [
+            'ok' => empty($issues),
+            'mode' => $mode,
+            'storage' => $storage,
+            'endpoint' => $this->getTrackEndpointUrl(),
+            'tracker_asset' => is_file(__DIR__ . '/assets/tracker.js'),
+            'issues' => $issues,
+            'warnings' => $warnings,
+            'health' => $health,
+        ];
+    }
+
+    /**
+     * Verify that the analytics schema is writable without polluting reports.
+     * A realistic row is inserted inside a transaction and always rolled back.
+     */
+    /**
+     * Render a one-time, self-contained diagnostic result dialog for module config.
+     * Output is fully escaped and CSS/JS are scoped to the NativeAnalytics modal.
+     */
+    protected static function renderTrackingDiagnosticResultModal(array $result) {
+        $wire = wire();
+        $sanitizer = $wire->sanitizer;
+        $level = (string) ($result['level'] ?? (!empty($result['ok']) ? 'success' : 'error'));
+        if(!in_array($level, ['success', 'warning', 'error'], true)) $level = 'error';
+        $ok = !empty($result['ok']);
+        $title = $level === 'warning' ? 'Tracking test passed with a warning' : ($ok ? 'Tracking test passed' : 'Tracking test failed');
+        $icon = $level === 'warning' ? 'fa-exclamation-triangle' : ($ok ? 'fa-check-circle' : 'fa-times-circle');
+        $message = trim((string) ($result['message'] ?? ''));
+        $checks = is_array($result['checks'] ?? null) ? $result['checks'] : [];
+
+        $checksHtml = '';
+        foreach($checks as $check) {
+            if(!is_array($check)) continue;
+            $status = (string) ($check['status'] ?? 'info');
+            if(!in_array($status, ['success', 'warning', 'error', 'info'], true)) $status = 'info';
+            $label = $sanitizer->entities((string) ($check['label'] ?? 'Check'));
+            $detail = $sanitizer->entities((string) ($check['detail'] ?? ''));
+            $checkIcon = $status === 'success' ? 'fa-check' : ($status === 'warning' ? 'fa-exclamation-triangle' : ($status === 'error' ? 'fa-times' : 'fa-info-circle'));
+            $checksHtml .= '<div class="pwna-diag-check pwna-diag-check--' . $status . '"><span class="pwna-diag-check-icon"><i class="fa ' . $checkIcon . '"></i></span><div><strong>' . $label . '</strong>' . ($detail !== '' ? '<div>' . $detail . '</div>' : '') . '</div></div>';
+        }
+
+        // Native HTML <dialog> deliberately avoids dependencies on AdminThemeUikit,
+        // jQuery UI or theme-specific modal APIs. A visible fallback card remains in
+        // the DOM if showModal() is unavailable or blocked, so a result can never be
+        // lost again.
+        $html = '<div class="pwna-diag-result-fallback" data-pwna-diag-fallback data-level="' . $level . '">'
+            . '<div class="pwna-diag-fallback-title"><i class="fa ' . $icon . '"></i> <strong>' . $sanitizer->entities($title) . '</strong></div>'
+            . '<p>Diagnostic completed. If the result dialog did not open automatically, <button type="button" class="pwna-diag-text-button" data-pwna-diag-open>open the result</button>.</p>'
+            . '</div>'
+            . '<dialog id="pwna-diagnostic-dialog" class="pwna-diag-dialog" data-level="' . $level . '" aria-labelledby="pwna-diag-title">'
+            . '<div class="pwna-diag-dialog-inner">'
+            . '<button type="button" class="pwna-diag-close" data-pwna-diag-close aria-label="Close"><i class="fa fa-times"></i></button>'
+            . '<div class="pwna-diag-heading"><span class="pwna-diag-heading-icon"><i class="fa ' . $icon . '"></i></span><div><div class="pwna-diag-kicker">NativeAnalytics diagnostics</div><h2 id="pwna-diag-title">' . $sanitizer->entities($title) . '</h2></div></div>'
+            . ($checksHtml !== '' ? '<div class="pwna-diag-checks">' . $checksHtml . '</div>' : '')
+            . ($message !== '' ? '<p class="pwna-diag-summary">' . $sanitizer->entities($message) . '</p>' : '')
+            . '<div class="pwna-diag-actions"><button type="button" class="ui-button ui-priority-primary pwna-diag-button" data-pwna-diag-close>Close</button></div>'
+            . '</div></dialog>';
+
+        $html .= '<style>'
+            . '.pwna-diag-result-fallback{box-sizing:border-box;margin:16px 0 0;padding:12px 14px;border:1px solid rgba(127,127,127,.28);border-left:4px solid #2e7d32;border-radius:4px;background:rgba(127,127,127,.06)}.pwna-diag-result-fallback[data-level=warning]{border-left-color:#b26a00}.pwna-diag-result-fallback[data-level=error]{border-left-color:#b42318}.pwna-diag-result-fallback p{margin:.35em 0 0}.pwna-diag-text-button{font:inherit;color:inherit;text-decoration:underline;border:0;background:none;padding:0;cursor:pointer}'
+            . '.pwna-diag-dialog{box-sizing:border-box;width:min(680px,calc(100vw - 32px));max-width:680px;max-height:calc(100vh - 32px);margin:auto;padding:0;border:0;border-radius:10px;background:#fff;color:#222;box-shadow:0 20px 70px rgba(0,0,0,.4);overflow:auto}.pwna-diag-dialog::backdrop{background:rgba(0,0,0,.58)}.pwna-diag-dialog-inner{position:relative;box-sizing:border-box;padding:28px}.pwna-diag-close{position:absolute;right:12px;top:12px;border:0;background:transparent;color:inherit;opacity:.65;font-size:18px;cursor:pointer;padding:8px}.pwna-diag-close:hover{opacity:1}.pwna-diag-heading{display:flex;gap:14px;align-items:center;padding-right:34px;margin-bottom:22px}.pwna-diag-heading-icon{font-size:32px}.pwna-diag-dialog[data-level=success] .pwna-diag-heading-icon,.pwna-diag-check--success .pwna-diag-check-icon{color:#2e7d32}.pwna-diag-dialog[data-level=warning] .pwna-diag-heading-icon,.pwna-diag-check--warning .pwna-diag-check-icon{color:#b26a00}.pwna-diag-dialog[data-level=error] .pwna-diag-heading-icon,.pwna-diag-check--error .pwna-diag-check-icon{color:#b42318}.pwna-diag-kicker{text-transform:uppercase;letter-spacing:.08em;font-size:11px;font-weight:700;opacity:.6}.pwna-diag-heading h2{margin:2px 0 0;font-size:22px;color:inherit}.pwna-diag-checks{border:1px solid rgba(127,127,127,.25);border-radius:8px;overflow:hidden}.pwna-diag-check{display:flex;gap:12px;padding:13px 15px;border-bottom:1px solid rgba(127,127,127,.18)}.pwna-diag-check:last-child{border-bottom:0}.pwna-diag-check-icon{width:20px;text-align:center;flex:0 0 20px}.pwna-diag-check div div{font-size:13px;opacity:.75;margin-top:2px}.pwna-diag-summary{margin:18px 0 0;line-height:1.55}.pwna-diag-actions{display:flex;justify-content:flex-end;margin-top:22px}.pwna-diag-button{cursor:pointer}@media(prefers-color-scheme:dark){.pwna-diag-dialog{background:#222;color:#f5f5f5}}@media(max-width:600px){.pwna-diag-dialog{width:calc(100vw - 20px);max-height:calc(100vh - 20px)}.pwna-diag-dialog-inner{padding:22px 18px}.pwna-diag-heading h2{font-size:19px}}'
+            . '</style>';
+        $html .= '<script>(function(){function init(){var d=document.getElementById("pwna-diagnostic-dialog"),f=document.querySelector("[data-pwna-diag-fallback]");if(!d)return;var previous=document.activeElement;function open(){if(typeof d.showModal==="function"){try{if(!d.open)d.showModal();if(f)f.style.display="none";}catch(e){if(f)f.style.display="block";}}else if(f){f.style.display="block";}}function close(){if(d.open&&typeof d.close==="function")d.close();if(previous&&previous.focus)try{previous.focus();}catch(e){}}document.querySelectorAll("[data-pwna-diag-open]").forEach(function(el){el.addEventListener("click",open);});d.querySelectorAll("[data-pwna-diag-close]").forEach(function(el){el.addEventListener("click",close);});d.addEventListener("click",function(e){if(e.target===d)close();});d.addEventListener("cancel",function(e){e.preventDefault();close();});open();}if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",init,{once:true});else init();})();</script>';
+        return $html;
+    }
+
+    public function runTrackingDiagnosticTest() {
+        $db = $this->wire('database');
+        $started = false;
+        try {
+            if($db->inTransaction()) {
+                return ['ok' => false, 'level' => 'error', 'message' => 'A database transaction is already active. Please reload the module settings and run the test again.', 'checks' => [['label' => 'Database', 'status' => 'error', 'detail' => 'Another database transaction is already active.']]];
+            }
+
+            // 1) Verify the same endpoint path normalisation used by real requests.
+            // This catches subdirectory installations without making an HTTP request.
+            $endpointPath = (string) parse_url($this->getTrackEndpointUrl(), PHP_URL_PATH);
+            $internalRouteOk = $this->getSpecialEndpointFromUri($endpointPath) === 'track';
+            if(!$internalRouteOk) {
+                return ['ok' => false, 'level' => 'error', 'message' => 'Internal endpoint routing test failed for ' . $endpointPath . '. The tracking endpoint would not be recognised by NativeAnalytics.', 'checks' => [['label' => 'Internal endpoint routing', 'status' => 'error', 'detail' => 'NativeAnalytics did not recognise ' . $endpointPath . ' as its tracking endpoint.']]];
+            }
+
+            // 2) Verify schema/write capability with a transaction that is always
+            // rolled back so diagnostics can never alter analytics reports.
+            $db->beginTransaction();
+            $started = true;
+            $now = date('Y-m-d H:i:s');
+            $path = '/__pwna_diagnostic__';
+            $row = [
+                'created_at' => $now, 'created_date' => date('Y-m-d'), 'created_hour' => (int) date('G'),
+                'page_id' => 0, 'page_title' => 'NativeAnalytics diagnostic', 'template' => 'diagnostic',
+                'url' => $this->wire('config')->urls->root . ltrim($path, '/'), 'path' => $path, 'path_hash' => md5($path),
+                'referrer_host' => '', 'referrer_url' => '', 'search_term' => '',
+                'utm_source' => '', 'utm_medium' => '', 'utm_campaign' => '', 'utm_term' => '', 'utm_content' => '',
+                'device_type' => 'diagnostic', 'browser' => 'diagnostic', 'os' => 'diagnostic', 'user_agent' => 'NativeAnalytics diagnostic',
+                'visitor_hash' => hash('sha256', 'pwna-diagnostic-visitor'), 'session_hash' => hash('sha256', 'pwna-diagnostic-session'),
+                'ip_hash' => hash('sha256', 'pwna-diagnostic-ip'), 'is_bot' => 0, 'status_code' => 200,
+            ];
+            $this->insert(self::HITS_TABLE, $row);
+            $stmt = $db->prepare("SELECT COUNT(*) FROM `" . self::HITS_TABLE . "` WHERE path=:path");
+            $stmt->execute([':path' => $path]);
+            $count = (int) $stmt->fetchColumn();
+            if($started && $db->inTransaction()) $db->rollBack();
+            $started = false;
+            if($count < 1) return ['ok' => false, 'level' => 'error', 'message' => 'Database accepted no diagnostic row.', 'checks' => [['label' => 'Internal endpoint routing', 'status' => 'success', 'detail' => 'Tracking route recognised correctly.'], ['label' => 'Raw hits database write', 'status' => 'error', 'detail' => 'The diagnostic row could not be verified.']]];
+
+            // 3) Optional public loopback check. This is deliberately advisory:
+            // many production hosts/WAFs block a server from requesting its own
+            // public hostname. That does not mean browser tracking is broken.
+            $endpointCode = 0;
+            $endpointUrl = $this->getTrackEndpointHttpUrl();
+            $endpointError = '';
+            if($endpointUrl !== '') {
+                try {
+                    $http = $this->wire(new WireHttp());
+                    $http->setTimeout(8);
+                    $http->get($endpointUrl . (strpos($endpointUrl, '?') === false ? '?' : '&') . 'pwna_diagnostic=1');
+                    $endpointCode = (int) $http->getHttpCode();
+                } catch(\Throwable $e) {
+                    $endpointError = $e->getMessage();
+                    $this->wire('log')->save('native-analytics', 'Optional public endpoint loopback diagnostic failed: ' . $endpointError);
+                }
+            } else {
+                $endpointError = 'Could not construct an absolute endpoint URL for the server-side loopback check.';
+            }
+
+            if(in_array($endpointCode, [204, 422], true)) {
+                return ['ok' => true, 'level' => 'success', 'message' => 'All core tracking diagnostics passed. The database test row was rolled back and is not included in reports.', 'checks' => [['label' => 'Internal endpoint routing', 'status' => 'success', 'detail' => 'Tracking route recognised correctly.'], ['label' => 'Public tracking endpoint', 'status' => 'success', 'detail' => 'Endpoint responded with HTTP ' . $endpointCode . '.'], ['label' => 'Raw hits database write', 'status' => 'success', 'detail' => 'Test write succeeded and was safely rolled back.']]];
+            }
+
+            $loopback = $endpointCode > 0 ? 'HTTP ' . $endpointCode : 'HTTP 0';
+            return [
+                'ok' => true,
+                'level' => 'warning',
+                'message' => 'Core tracking checks passed. The optional server-to-self public endpoint check could not be confirmed; this does not by itself mean visitor tracking is broken.',
+                'checks' => [
+                    ['label' => 'Internal endpoint routing', 'status' => 'success', 'detail' => 'Tracking route recognised correctly.'],
+                    ['label' => 'Public tracking endpoint', 'status' => 'warning', 'detail' => 'Optional loopback check returned ' . $loopback . '. Hosting, DNS, SSL, reverse proxy, Cloudflare/WAF, or firewall rules can block server-to-self requests.'],
+                    ['label' => 'Raw hits database write', 'status' => 'success', 'detail' => 'Test write succeeded and was safely rolled back.'],
+                ]
+            ];
+        } catch(\Throwable $e) {
+            if($started && $db->inTransaction()) $db->rollBack();
+            $this->wire('log')->save('native-analytics', 'Tracking diagnostic failed: ' . $e->getMessage());
+            return ['ok' => false, 'level' => 'error', 'message' => $e->getMessage(), 'checks' => [['label' => 'Diagnostic execution', 'status' => 'error', 'detail' => 'The test stopped because an exception occurred.']]];
+        }
+    }
+
     public function getHealthSnapshot() {
         $db = $this->wire('database');
         $snapshot = [
@@ -5067,7 +5356,7 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
 
         $input = $this->wire('input');
         $action = (string) $input->get('pwna_maintenance_action');
-        if($action !== 'purge_now' && $action !== 'optimize_now') return;
+        if(!in_array($action, ['purge_now', 'optimize_now', 'tracking_test'], true)) return;
 
         $session = $this->wire('session');
         $user = $this->wire('user');
@@ -5087,7 +5376,15 @@ class NativeAnalytics extends WireData implements Module, ConfigurableModule {
         }
 
         try {
-            if($action === 'purge_now') {
+            if($action === 'tracking_test') {
+                $result = $this->runTrackingDiagnosticTest();
+                // Store the complete result for a one-time modal on the settings page.
+                // A normal ProcessWire notice is intentionally not used here: the
+                // diagnostic contains several independent checks and is much easier
+                // to understand as a structured result. getModuleConfigInputfields()
+                // consumes and removes this value after the redirect.
+                $session->setFor('NativeAnalytics', 'trackingDiagnosticResult', $result);
+            } elseif($action === 'purge_now') {
                 $deleted = $this->runManualPurge();
                 $msg = 'NativeAnalytics: Cleanup complete. Removed ' . number_format($deleted) . ' old raw rows.';
                 if(!empty($this->optimizeAfterPurge) && $deleted > 0) {

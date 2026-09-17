@@ -1,10 +1,10 @@
-NativeAnalytics 1.0.32
+NativeAnalytics 1.0.33
 
 # NativeAnalytics
 
 Native first-party analytics module for ProcessWire CMS. It tracks traffic and engagement directly inside ProcessWire, without Google Analytics or external APIs.
 
-## Features in v1.0.32
+## Features in v1.0.33
 
 NativeAnalytics is a first-party analytics dashboard for ProcessWire. It keeps the tracking data inside your ProcessWire installation and does not rely on Google Analytics, external tracking scripts or remote analytics APIs.
 
@@ -252,6 +252,31 @@ Thanks to **[adrianbj](https://github.com/adrianbj)** for all five improvements 
 
 - **Fixed the tracking endpoint being recorded as a pageview.** On some setups (ProcessWire installed in a subdirectory, behind a reverse proxy, or where the `/pwna-track/` request was not recognised as the analytics endpoint) the endpoint's own path could leak into stored hits. The result was that **Top pages**, **Top landing pages** and **Top exit pages** all showed only `/pwna-track/`, with sessions started equal to sessions ended. A new `isEndpointPath()` guard now hard-excludes `/pwna-track/` and `/pwna-realtime/` from being stored as a pageview or event, and the `getRequestPathForStorage()` fallback can no longer return an endpoint path. Existing `/pwna-track/` rows can be cleaned up via the suspicious-path removal tool.
 - Updated module version metadata to `1.0.27` / integer `1027`.
+
+## 1.0.33 notes
+
+### Tracking reliability & configuration persistence
+- Fixed a critical configuration persistence bug in internal maintenance/schema markers. Runtime updates now merge into the complete persisted module configuration instead of saving a one-key config array. This prevents user choices such as **Server-side only**, **Cookie-less**, consent, exclusions and other settings from apparently resetting after schema checks, hourly/daily maintenance, funnel saves or manual maintenance.
+- This also prevents installations from unexpectedly falling back from **Server-side only** to the default **JavaScript first** mode after an internal config write.
+- Added a reliable fallback for pages that use an HTML `<meta http-equiv="refresh">` redirect. In JS-first mode, rendered meta-refresh pages are recorded server-side before navigation and the client auto-pageview is suppressed to avoid duplicates. Server-only and Both modes keep their existing behavior.
+- Added protection against duplicate server-side pageview recording during repeated render hooks.
+- Tracking/database failures are logged to the dedicated NativeAnalytics log for easier troubleshooting.
+
+### Tracking health & diagnostics
+- Added a native **Tracking health & diagnostics** panel showing tracking state, mode, storage mode, tracker availability, raw-hit count and last recorded hit.
+- Added a CSRF-protected **Run tracking test** action that verifies internal endpoint routing, public endpoint reachability and a real raw-table database write.
+- The database test runs inside a transaction and is rolled back, so diagnostic rows never enter analytics reports.
+- Public server-to-self/loopback reachability is advisory: an HTTP 0 response no longer marks tracking as failed when internal routing and database writes pass.
+- Public endpoint checks use an absolute HTTP(S) URL with `WireHttp`, while browser tracking continues to use the normal site-relative endpoint.
+- Endpoint recognition is normalised for ProcessWire installations in a subdirectory and shared by live endpoint handling and diagnostics.
+- Diagnostic results are shown in an accessible native HTML `<dialog>` modal that does not depend on AdminThemeUikit or jQuery UI. An inline fallback keeps the result visible if the browser/admin theme cannot open the dialog.
+- The result modal supports Close, Escape and backdrop click and is responsive across ProcessWire admin themes.
+
+### Data safety
+- Analytics tables are preserved on uninstall by default. Deleting collected analytics data is now an explicit opt-in setting instead of a silent destructive action.
+- Added configuration-integrity checks and clearer diagnostics for common zero-data situations such as disabled tracking, consent/DNT restrictions and excluded roles.
+
+- Updated NativeAnalytics and dashboard version metadata consistently to `1.0.33` / integer `1033`.
 
 ## 1.0.32 notes
 
